@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ErrorCode,
+  InitializeRequestSchema,
   ListToolsRequestSchema,
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -12,6 +13,8 @@ import winston from "winston";
 import os from "os";
 import path from "path";
 import fs from "fs";
+import express from "express";
+import type { Request, Response } from "express";
 import {
   BitbucketPaginator,
   BITBUCKET_ALL_ITEMS_CAP,
@@ -78,13 +81,55 @@ function getLogFilePath(): string | undefined {
 }
 
 const resolvedLogFile = getLogFilePath();
+const transports: winston.transport[] = [];
+
+// Always add console transport for visibility
+transports.push(
+  new winston.transports.Console({
+    format: winston.format.combine(
+      winston.format.colorize(),
+      winston.format.timestamp({ format: "YYYY-MM-DD HH:mm:ss" }),
+      winston.format.printf(({ timestamp, level, message, ...meta }) => {
+        const metaStr = Object.keys(meta).length ? JSON.stringify(meta) : "";
+        return `${timestamp} [${level}] ${message} ${metaStr}`;
+      })
+    ),
+  })
+);
+
+// Add file transport if logging is enabled
+if (resolvedLogFile) {
+  transports.push(
+    new winston.transports.File({
+      filename: resolvedLogFile,
+      format: winston.format.json(),
+    })
+  );
+}
+
 const logger = winston.createLogger({
-  level: "info",
-  format: winston.format.json(),
-  transports: resolvedLogFile
-    ? [new winston.transports.File({ filename: resolvedLogFile })]
-    : [],
+  level: process.env.BITBUCKET_LOG_LEVEL || "info",
+  transports,
 });
+
+// Helper function to serialize errors for logging
+function serializeError(error: unknown): Record<string, any> {
+  if (error instanceof Error) {
+    return {
+      message: error.message,
+      name: error.name,
+      stack: error.stack,
+      ...(axios.isAxiosError(error) && {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        url: error.config?.url,
+        method: error.config?.method,
+        responseData: error.response?.data,
+      }),
+    };
+  }
+  return { error: String(error) };
+}
 
 const PAGINATION_BASE_SCHEMA = {
   pagelen: {
@@ -472,18 +517,69 @@ interface BitbucketPipelineCommand {
 // =========== MCP SERVER ===========
 class BitbucketServer {
   private readonly server: Server;
-  private readonly api: AxiosInstance;
-  private readonly config: BitbucketConfig;
-  private readonly paginator: BitbucketPaginator;
+  private api: AxiosInstance | null = null;
+  private config: BitbucketConfig | null = null;
+  private paginator: BitbucketPaginator | null = null;
   private readonly dangerousToolNames = new Set<string>([
     "deletePullRequestComment",
     "deletePullRequestTask",
   ]);
+  // Store handler references for HTTP transport
+  private listToolsHandler?: (request?: any) => Promise<any>;
+  private callToolHandler?: (request: any, connectionId?: string) => Promise<any>;
+  // Store client configurations (for HTTP/SSE multi-client support)
+  private clientConfigs = new Map<string, BitbucketConfig>();
+  
+  // Expose handlers for HTTP transport
+  getServer(): Server {
+    return this.server;
+  }
   private isDangerousTool(name: string): boolean {
     // Explicitly dangerous or conservative prefix match (delete*)
     if (this.dangerousToolNames.has(name)) return true;
     if (/^delete/i.test(name)) return true;
     return false;
+  }
+
+  /**
+   * Normalizes workspace parameter, detecting placeholder values that AI might pass.
+   * Falls back to configured default workspace if the provided value looks like a placeholder.
+   */
+  private normalizeWorkspace(workspace?: string, clientId?: string): string | undefined {
+    // If no workspace provided, use default
+    if (!workspace) {
+      const { config } = this.getConfig(clientId);
+      return config.defaultWorkspace || undefined;
+    }
+
+    // Check for common placeholder patterns that AI might send
+    const placeholderPatterns = [
+      /^BITBUCKET_/i,           // "BITBUCKET_WORKSPACE", "BITBUCKET_WS", etc.
+      /^default$/i,             // "default"
+      /^workspace$/i,            // "workspace"
+      /^<.*>$/i,                // "<workspace>", "<BITBUCKET_WORKSPACE>", etc.
+      /^\{.*\}$/i,              // "{workspace}", "{BITBUCKET_WORKSPACE}", etc.
+      /^\[.*\]$/i,              // "[workspace]", etc.
+      /^placeholder$/i,         // "placeholder"
+      /^example$/i,              // "example"
+      /^your-.*$/i,             // "your-workspace", "your-ws", etc.
+      /^env\./i,                // "env.BITBUCKET_WORKSPACE"
+      /^\$.*$/i,                // "$BITBUCKET_WORKSPACE", "$workspace"
+    ];
+
+    const isPlaceholder = placeholderPatterns.some(pattern => pattern.test(workspace));
+
+    if (isPlaceholder) {
+      const { config } = this.getConfig(clientId);
+      logger.warn("AI passed placeholder value instead of actual workspace, using default", {
+        providedByAI: workspace,
+        usingInstead: config.defaultWorkspace,
+      });
+      return config.defaultWorkspace;
+    }
+
+    // Valid workspace provided, use it
+    return workspace;
   }
 
   constructor() {
@@ -500,9 +596,57 @@ class BitbucketServer {
       }
     );
 
-    // Configuration from environment variables
+    // Setup tool handlers using the request handler pattern
+    this.setupToolHandlers();
+
+    // Register initialize handler to extract config from client
+    this.server.setRequestHandler(InitializeRequestSchema, async (request) => {
+      // Extract configuration from client (params.initializationOptions or params.env)
+      const clientConfig: Record<string, any> = (request.params?.initializationOptions as Record<string, any>) || (request.params?.env as Record<string, any>) || {};
+      const bitbucketConfig: BitbucketConfig = {
+        baseUrl: clientConfig.BITBUCKET_URL || process.env.BITBUCKET_URL || "https://api.bitbucket.org/2.0",
+        token: clientConfig.BITBUCKET_TOKEN || process.env.BITBUCKET_TOKEN,
+        username: clientConfig.BITBUCKET_USERNAME || process.env.BITBUCKET_USERNAME,
+        password: clientConfig.BITBUCKET_PASSWORD || process.env.BITBUCKET_PASSWORD,
+        defaultWorkspace: clientConfig.BITBUCKET_WORKSPACE || process.env.BITBUCKET_WORKSPACE,
+        allowDangerousCommands: clientConfig.BITBUCKET_ENABLE_DANGEROUS === "true" || clientConfig.BITBUCKET_ENABLE_DANGEROUS === true,
+      };
+      
+      // Initialize config from client (prefer client config over env)
+      if (bitbucketConfig.token || (bitbucketConfig.username && bitbucketConfig.password)) {
+        try {
+          this.initializeConfig(bitbucketConfig, "MCP client config");
+          logger.info("Configuration initialized from MCP client (stdio)");
+        } catch (error: any) {
+          logger.error("Failed to initialize config from client", { error: error.message });
+          // Fall back to env if client config fails
+          this.initializeFromEnv();
+        }
+      } else {
+        // No client config, try env
+        this.initializeFromEnv();
+      }
+      
+      return {
+        protocolVersion: "2024-11-05",
+        capabilities: { tools: {} },
+        serverInfo: { name: "bitbucket-mcp-server", version: "1.0.0" },
+      };
+    });
+
+    // Add error handler - CRITICAL for stability
+    this.server.onerror = (error) => logger.error("[MCP Error]", error);
+    
+    // Try to initialize from environment variables (fallback if no client config provided)
+    this.initializeFromEnv();
+  }
+
+  /**
+   * Initialize configuration from environment variables (fallback)
+   */
+  private initializeFromEnv() {
     const initialConfig: BitbucketConfig = {
-      baseUrl: process.env.BITBUCKET_URL ?? "https://api.bitbucket.org/2.0",
+      baseUrl: process.env.BITBUCKET_URL || "https://api.bitbucket.org/2.0",
       token: process.env.BITBUCKET_TOKEN,
       username: process.env.BITBUCKET_USERNAME,
       password: process.env.BITBUCKET_PASSWORD,
@@ -511,21 +655,10 @@ class BitbucketServer {
 
     const normalizedConfig = normalizeBitbucketConfig(initialConfig);
 
-    if (
-      normalizedConfig.baseUrl !== initialConfig.baseUrl ||
-      normalizedConfig.defaultWorkspace !== initialConfig.defaultWorkspace
-    ) {
-      logger.info("Normalized Bitbucket configuration", {
-        fromBaseUrl: initialConfig.baseUrl,
-        toBaseUrl: normalizedConfig.baseUrl,
-        defaultWorkspace: normalizedConfig.defaultWorkspace,
-      });
-    }
-
     // Parse dangerous commands toggle (off by default)
     const enableDangerousEnv = (
-      process.env.BITBUCKET_ENABLE_DANGEROUS ??
-      process.env.BITBUCKET_ALLOW_DANGEROUS ??
+      process.env.BITBUCKET_ENABLE_DANGEROUS ||
+      process.env.BITBUCKET_ALLOW_DANGEROUS ||
       ""
     )
       .toString()
@@ -534,45 +667,179 @@ class BitbucketServer {
       enableDangerousEnv
     );
 
-    this.config = { ...normalizedConfig, allowDangerousCommands };
+    const envConfig = { ...normalizedConfig, allowDangerousCommands };
+    
+    // Only initialize if we have required config from env
+    if (envConfig.token || (envConfig.username && envConfig.password)) {
+      this.initializeConfig(envConfig, "environment variables");
+    }
+  }
+
+  /**
+   * Initialize or update configuration from client (MCP config)
+   */
+  private initializeConfig(config: BitbucketConfig, source: string, clientId?: string) {
+    const normalizedConfig = normalizeBitbucketConfig(config);
+
+    // Parse dangerous commands toggle
+    const enableDangerousEnv = (
+      normalizedConfig.allowDangerousCommands?.toString().toLowerCase() ||
+      process.env.BITBUCKET_ENABLE_DANGEROUS ||
+      process.env.BITBUCKET_ALLOW_DANGEROUS ||
+      ""
+    )
+      .toString()
+      .toLowerCase();
+    const allowDangerousCommands = ["1", "true", "yes", "on"].includes(
+      enableDangerousEnv
+    );
+
+    const finalConfig: BitbucketConfig = { ...normalizedConfig, allowDangerousCommands };
 
     // Validate required config
-    if (!this.config.baseUrl) {
+    if (!finalConfig.baseUrl) {
       throw new Error("BITBUCKET_URL is required");
     }
 
-    if (!this.config.token && !(this.config.username && this.config.password)) {
+    if (!finalConfig.token && !(finalConfig.username && finalConfig.password)) {
       throw new Error(
-        "Either BITBUCKET_TOKEN or BITBUCKET_USERNAME/PASSWORD is required"
+        "Either BITBUCKET_TOKEN (with BITBUCKET_USERNAME) or BITBUCKET_USERNAME/PASSWORD is required"
       );
     }
 
     // Setup Axios instance
     const headers: Record<string, string> = {};
-    if (this.config.token) {
-      headers.Authorization = `Bearer ${this.config.token}`;
+    let authConfig: { username: string; password: string } | undefined;
+    
+    if (finalConfig.token) {
+      if (!finalConfig.username) {
+        throw new Error(
+          "BITBUCKET_USERNAME (your Atlassian account email) is required when using BITBUCKET_TOKEN. " +
+          "API tokens must be used with Basic Auth: email:token"
+        );
+      }
+      
+      authConfig = {
+        username: finalConfig.username,
+        password: finalConfig.token,
+      };
+      
+      const tokenDebug = process.env.BITBUCKET_LOG_TOKEN === "true" || process.env.BITBUCKET_DEBUG_TOKEN === "true";
+      logger.info(`Bitbucket API authentication configured from ${source} (API Token with Basic Auth)`, {
+        hasToken: true,
+        tokenLength: finalConfig.token.length,
+        tokenPrefix: finalConfig.token.substring(0, 15) + "...",
+        tokenSuffix: tokenDebug ? "..." + finalConfig.token.substring(finalConfig.token.length - 10) : undefined,
+        tokenFull: tokenDebug ? finalConfig.token : undefined,
+        username: finalConfig.username,
+        authMethod: "Basic Auth (email:token)",
+        baseUrl: finalConfig.baseUrl,
+        defaultWorkspace: finalConfig.defaultWorkspace,
+        clientId,
+      });
+    } else if (finalConfig.username && finalConfig.password) {
+      authConfig = {
+        username: finalConfig.username,
+        password: finalConfig.password,
+      };
+      
+      logger.info(`Bitbucket API authentication configured from ${source} (App Password)`, {
+        hasToken: false,
+        hasUsername: true,
+        username: finalConfig.username,
+        authMethod: "Basic Auth (username:password)",
+        baseUrl: finalConfig.baseUrl,
+        defaultWorkspace: finalConfig.defaultWorkspace,
+        clientId,
+      });
     }
-    this.api = axios.create({
-      baseURL: this.config.baseUrl,
+    
+    const api = axios.create({
+      baseURL: finalConfig.baseUrl,
       headers,
-      auth:
-        this.config.username && this.config.password
-          ? { username: this.config.username, password: this.config.password }
-          : undefined,
+      auth: authConfig,
     });
 
-    this.paginator = new BitbucketPaginator(this.api, logger);
+    const paginator = new BitbucketPaginator(api, logger);
 
-    // Setup tool handlers using the request handler pattern
-    this.setupToolHandlers();
+    // Store config (per-client for HTTP/SSE, global for stdio)
+    if (clientId) {
+      this.clientConfigs.set(clientId, finalConfig);
+    } else {
+      this.config = finalConfig;
+      this.api = api;
+      this.paginator = paginator;
+    }
 
-    // Add error handler - CRITICAL for stability
-    this.server.onerror = (error) => logger.error("[MCP Error]", error);
+    return { config: finalConfig, api, paginator };
+  }
+
+  /**
+   * Get configuration for a specific client (or default for stdio)
+   */
+  private getConfig(clientId?: string): { config: BitbucketConfig; api: AxiosInstance; paginator: BitbucketPaginator } {
+    if (clientId) {
+      let clientConfig = this.clientConfigs.get(clientId);
+      
+      // If config not found for this clientId, try to find the most recent config
+      // This handles the case where SSE connection ID differs from initialize connection ID
+      if (!clientConfig && this.clientConfigs.size > 0) {
+        // Get the most recently added config (last entry in Map)
+        const configs = Array.from(this.clientConfigs.entries());
+        if (configs.length > 0) {
+          const [mostRecentId, mostRecentConfig] = configs[configs.length - 1];
+          logger.debug("Config not found for connectionId, using most recent config", {
+            requestedId: clientId,
+            usingId: mostRecentId,
+            totalConfigs: this.clientConfigs.size,
+          });
+          clientConfig = mostRecentConfig;
+          // Optionally, associate this config with the new connectionId for future calls
+          this.clientConfigs.set(clientId, mostRecentConfig);
+        }
+      }
+      
+      if (clientConfig) {
+        // Recreate API instance for this client
+        const headers: Record<string, string> = {};
+        let authConfig: { username: string; password: string } | undefined;
+        
+        if (clientConfig.token && clientConfig.username) {
+          authConfig = { username: clientConfig.username, password: clientConfig.token };
+        } else if (clientConfig.username && clientConfig.password) {
+          authConfig = { username: clientConfig.username, password: clientConfig.password };
+        }
+        
+        const api = axios.create({
+          baseURL: clientConfig.baseUrl,
+          headers,
+          auth: authConfig,
+        });
+        
+        return {
+          config: clientConfig,
+          api,
+          paginator: new BitbucketPaginator(api, logger),
+        };
+      }
+    }
+    
+    if (!this.config || !this.api || !this.paginator) {
+      throw new Error(
+        "Bitbucket configuration not initialized. Please provide configuration in MCP client config or environment variables."
+      );
+    }
+    
+    return {
+      config: this.config,
+      api: this.api,
+      paginator: this.paginator,
+    };
   }
 
   private setupToolHandlers() {
-    // Register the list tools handler
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    // Register the list tools handler and store reference
+    this.listToolsHandler = async () => ({
       tools: [
         {
           name: "listRepositories",
@@ -1855,25 +2122,36 @@ class BitbucketServer {
           },
         },
       ].filter(
-        (tool) =>
-          this.config.allowDangerousCommands === true ||
-          !this.isDangerousTool(tool.name)
+        (tool) => {
+          try {
+            const { config } = this.getConfig();
+            return config.allowDangerousCommands === true || !this.isDangerousTool(tool.name);
+          } catch {
+            // Config not initialized yet, filter based on tool name only
+            return !this.isDangerousTool(tool.name);
+          }
+        }
       ),
-    }));
+    });
+    
+    // Register the stored handler with the server
+    this.server.setRequestHandler(ListToolsRequestSchema, this.listToolsHandler);
 
-    // Register the call tool handler
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    // Register the call tool handler and store reference
+    this.callToolHandler = async (request, connectionId?: string) => {
       try {
         logger.info(`Called tool: ${request.params.name}`, {
           arguments: request.params.arguments,
+          connectionId,
         });
-        const args = request.params.arguments ?? {};
+        const args = request.params.arguments || {};
         const toolName = request.params.name;
 
         // Guard dangerous tools when not enabled
+        const { config } = this.getConfig(connectionId);
         if (
           this.isDangerousTool(toolName) &&
-          this.config.allowDangerousCommands !== true
+          config.allowDangerousCommands !== true
         ) {
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1889,7 +2167,8 @@ class BitbucketServer {
               args.page as number,
               args.all as boolean,
               args.name as string,
-              args.limit as number
+              args.limit as number,
+              connectionId
             );
           case "getRepository":
             return await this.getRepository(
@@ -2267,17 +2546,42 @@ class BitbucketServer {
             );
         }
       } catch (error) {
-        logger.error("Tool execution error", { error });
+        logger.error("Tool execution error", serializeError(error));
         if (axios.isAxiosError(error)) {
+          const status = error.response?.status;
+          const statusText = error.response?.statusText;
+          const errorMessage = error.response?.data?.message || error.response?.data?.error?.message || error.message;
+          
+          // Enhanced error messages for common issues
+          if (status === 401) {
+            const { config } = this.getConfig(connectionId);
+            logger.error("Authentication failed (401)", {
+              url: error.config?.url,
+              method: error.config?.method,
+              hasToken: !!config.token,
+              hasUsername: !!config.username,
+              status,
+              statusText,
+              errorMessage,
+            });
+            throw new McpError(
+              ErrorCode.InternalError,
+              `Authentication failed (401): ${errorMessage || "Invalid or expired token. Please check your BITBUCKET_TOKEN."}`
+            );
+          }
+          
           throw new McpError(
             ErrorCode.InternalError,
-            `Bitbucket API error: ${
-              error.response?.data.message ?? error.message
-            }`
+            `Bitbucket API error (${status || "unknown"}): ${errorMessage}`
           );
         }
         throw error;
       }
+    };
+    
+    // Register the stored handler with the server (wrap to match expected signature)
+    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      return await this.callToolHandler!(request);
     });
   }
 
@@ -2287,22 +2591,25 @@ class BitbucketServer {
     page?: number,
     all?: boolean,
     name?: string,
-    legacyLimit?: number
+    legacyLimit?: number,
+    connectionId?: string
   ) {
-    try {
-      // Use default workspace if not provided
-      const wsName = workspace || this.config.defaultWorkspace;
+    // Normalize workspace - handles any placeholder values AI might pass
+    // Declare outside try block so it's accessible in catch handlers
+    const wsName = this.normalizeWorkspace(workspace, connectionId);
 
-      if (!wsName) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          "Workspace must be provided either as a parameter or through BITBUCKET_WORKSPACE environment variable"
-        );
-      }
+    if (!wsName) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        "Workspace must be provided either as a parameter or through BITBUCKET_WORKSPACE environment variable"
+      );
+    }
+
+    try {
 
       logger.info("Listing Bitbucket repositories", {
         workspace: wsName,
-        pagelen: pagelen ?? legacyLimit,
+        pagelen: pagelen || legacyLimit,
         page,
         all,
         name,
@@ -2313,10 +2620,11 @@ class BitbucketServer {
         params.q = `name~"${name}"`;
       }
 
-      const repositories = await this.paginator.fetchValues<BitbucketRepository>(
+      const { paginator } = this.getConfig(connectionId);
+      const repositories = await paginator.fetchValues<BitbucketRepository>(
         `/repositories/${wsName}`,
         {
-          pagelen: pagelen ?? legacyLimit,
+          pagelen: pagelen || legacyLimit,
           page,
           all,
           params,
@@ -2333,7 +2641,48 @@ class BitbucketServer {
         ],
       };
     } catch (error) {
-      logger.error("Error listing repositories", { error, workspace, name });
+      if (axios.isAxiosError(error)) {
+        const status = error.response?.status;
+        const statusText = error.response?.statusText;
+        const errorMessage = error.response?.data?.message || error.response?.data?.error?.message || error.message;
+        
+        // wsName is already normalized at the top of the function
+        const { config } = this.getConfig(connectionId);
+        const tokenDebug = process.env.BITBUCKET_LOG_TOKEN === "true" || process.env.BITBUCKET_DEBUG_TOKEN === "true";
+        logger.error("Error listing repositories", {
+          error: errorMessage,
+          status,
+          statusText,
+          workspace: wsName,
+          url: error.config?.url,
+          hasToken: !!config.token,
+          tokenLength: config.token?.length || 0,
+          tokenPrefix: config.token ? config.token.substring(0, 15) + "..." : "none",
+          tokenSuffix: tokenDebug && config.token ? "..." + config.token.substring(config.token.length - 10) : undefined,
+          tokenFull: tokenDebug ? config.token : undefined,
+          authHeader: error.config?.headers?.Authorization ? String(error.config.headers.Authorization).substring(0, 20) + "..." : undefined,
+        });
+        
+        if (status === 401) {
+          throw new McpError(
+            ErrorCode.InternalError,
+            `Authentication failed (401): ${errorMessage || "Invalid or expired token. Please check your BITBUCKET_TOKEN."}`
+          );
+        }
+        
+        throw new McpError(
+          ErrorCode.InternalError,
+          `Failed to list repositories (${status || "unknown"}): ${errorMessage}`
+        );
+      }
+      
+      // wsName is already normalized at the top of the function
+      const { config } = this.getConfig(connectionId);
+      logger.error("Error listing repositories", { 
+        ...serializeError(error),
+        workspace: wsName || workspace || config.defaultWorkspace, 
+        name 
+      });
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to list repositories: ${
@@ -2345,12 +2694,13 @@ class BitbucketServer {
 
   async getRepository(workspace: string, repo_slug: string) {
     try {
+      const { api } = this.getConfig();
       logger.info("Getting Bitbucket repository info", {
         workspace,
         repo_slug,
       });
 
-      const response = await this.api.get(
+      const response = await api.get(
         `/repositories/${workspace}/${repo_slug}`
       );
 
@@ -2363,7 +2713,7 @@ class BitbucketServer {
         ],
       };
     } catch (error) {
-      logger.error("Error getting repository", { error, workspace, repo_slug });
+      logger.error("Error getting repository", { ...serializeError(error), workspace, repo_slug });
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get repository: ${
@@ -2375,12 +2725,13 @@ class BitbucketServer {
 
   async getEffectiveDefaultReviewers(workspace: string, repo_slug: string) {
     try {
+      const { api } = this.getConfig();
       logger.info("Getting effective default reviewers", {
         workspace,
         repo_slug,
       });
 
-      const response = await this.api.get(
+      const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/effective-default-reviewers`
       );
 
@@ -2421,7 +2772,7 @@ class BitbucketServer {
         workspace,
         repo_slug,
         state,
-        pagelen: pagelen ?? legacyLimit,
+        pagelen: pagelen || legacyLimit,
         page,
         all,
       });
@@ -2431,10 +2782,11 @@ class BitbucketServer {
         params.state = state;
       }
 
-      const result = await this.paginator.fetchValues<BitbucketPullRequest>(
+      const { paginator } = this.getConfig();
+      const result = await paginator.fetchValues<BitbucketPullRequest>(
         `/repositories/${workspace}/${repo_slug}/pullrequests`,
         {
-          pagelen: pagelen ?? legacyLimit,
+          pagelen: pagelen || legacyLimit,
           page,
           all,
           params,
@@ -2476,6 +2828,7 @@ class BitbucketServer {
     draft?: boolean
   ) {
     try {
+      const { api } = this.getConfig();
       logger.info("Creating Bitbucket pull request", {
         workspace,
         repo_slug,
@@ -2528,7 +2881,7 @@ class BitbucketServer {
       }
 
       // Create the pull request
-      const response = await this.api.post(
+      const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests`,
         requestPayload
       );
@@ -2568,7 +2921,8 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      const response = await this.api.get(
+      const { api } = this.getConfig();
+      const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`
       );
 
@@ -2615,7 +2969,8 @@ class BitbucketServer {
       if (title !== undefined) updateData.title = title;
       if (description !== undefined) updateData.description = description;
 
-      const response = await this.api.put(
+      const { api } = this.getConfig();
+      const response = await api.put(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`,
         updateData
       );
@@ -2662,7 +3017,8 @@ class BitbucketServer {
         all,
       });
 
-      const result = await this.paginator.fetchValues(
+      const { paginator } = this.getConfig();
+      const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/activity`,
         {
           pagelen,
@@ -2708,7 +3064,8 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      const response = await this.api.post(
+      const { api } = this.getConfig();
+      const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/approve`
       );
 
@@ -2748,7 +3105,8 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      const response = await this.api.delete(
+      const { api } = this.getConfig();
+      const response = await api.delete(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/approve`
       );
 
@@ -2792,7 +3150,8 @@ class BitbucketServer {
       // Include message if provided
       const data = message ? { message } : {};
 
-      const response = await this.api.post(
+      const { api } = this.getConfig();
+      const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/decline`,
         data
       );
@@ -2841,7 +3200,8 @@ class BitbucketServer {
       if (message) data.message = message;
       if (strategy) data.merge_strategy = strategy;
 
-      const response = await this.api.post(
+      const { api } = this.getConfig();
+      const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/merge`,
         data
       );
@@ -2888,7 +3248,8 @@ class BitbucketServer {
         all,
       });
 
-      const result = await this.paginator.fetchValues(
+      const { paginator } = this.getConfig();
+      const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
         {
           pagelen,
@@ -2935,7 +3296,8 @@ class BitbucketServer {
       });
 
       // First get the pull request details to extract commit information
-      const prResponse = await this.api.get(
+      const { api } = this.getConfig();
+      const prResponse = await api.get(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`
       );
 
@@ -2946,7 +3308,7 @@ class BitbucketServer {
       // The format is: /repositories/{workspace}/{repo_slug}/diff/{source_repo}:{source_commit}%0D{destination_commit}?from_pullrequest_id={pr_id}&topic=true
       const diffUrl = `/repositories/${workspace}/${repo_slug}/diff/${workspace}/${repo_slug}:${sourceCommit}%0D${destinationCommit}?from_pullrequest_id=${pull_request_id}&topic=true`;
 
-      const response = await this.api.get(diffUrl, {
+      const response = await api.get(diffUrl, {
         headers: {
           Accept: "text/plain",
         },
@@ -2996,7 +3358,8 @@ class BitbucketServer {
         all,
       });
 
-      const result = await this.paginator.fetchValues(
+      const { paginator } = this.getConfig();
+      const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/commits`,
         {
           pagelen,
@@ -3073,7 +3436,8 @@ class BitbucketServer {
         }
       }
 
-      const response = await this.api.post(
+      const { api } = this.getConfig();
+      const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
         commentData
       );
@@ -3104,12 +3468,13 @@ class BitbucketServer {
 
   async getRepositoryBranchingModel(workspace: string, repo_slug: string) {
     try {
+      const { api } = this.getConfig();
       logger.info("Getting repository branching model", {
         workspace,
         repo_slug,
       });
 
-      const response = await this.api.get(
+      const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/branching-model`
       );
 
@@ -3146,7 +3511,8 @@ class BitbucketServer {
         repo_slug,
       });
 
-      const response = await this.api.get(
+      const { api } = this.getConfig();
+      const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/branching-model/settings`
       );
 
@@ -3195,7 +3561,8 @@ class BitbucketServer {
       if (production) updateData.production = production;
       if (branch_types) updateData.branch_types = branch_types;
 
-      const response = await this.api.put(
+      const { api } = this.getConfig();
+      const response = await api.put(
         `/repositories/${workspace}/${repo_slug}/branching-model/settings`,
         updateData
       );
@@ -3233,7 +3600,8 @@ class BitbucketServer {
         repo_slug,
       });
 
-      const response = await this.api.get(
+      const { api } = this.getConfig();
+      const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/effective-branching-model`
       );
 
@@ -3262,12 +3630,13 @@ class BitbucketServer {
 
   async getProjectBranchingModel(workspace: string, project_key: string) {
     try {
+      const { api } = this.getConfig();
       logger.info("Getting project branching model", {
         workspace,
         project_key,
       });
 
-      const response = await this.api.get(
+      const response = await api.get(
         `/workspaces/${workspace}/projects/${project_key}/branching-model`
       );
 
@@ -3304,7 +3673,8 @@ class BitbucketServer {
         project_key,
       });
 
-      const response = await this.api.get(
+      const { api } = this.getConfig();
+      const response = await api.get(
         `/workspaces/${workspace}/projects/${project_key}/branching-model/settings`
       );
 
@@ -3353,7 +3723,8 @@ class BitbucketServer {
       if (production) updateData.production = production;
       if (branch_types) updateData.branch_types = branch_types;
 
-      const response = await this.api.put(
+      const { api } = this.getConfig();
+      const response = await api.put(
         `/workspaces/${workspace}/projects/${project_key}/branching-model/settings`,
         updateData
       );
@@ -3434,7 +3805,8 @@ class BitbucketServer {
       });
 
       // First, get all pending comments for the pull request
-      const commentsResult = await this.paginator.fetchValues(
+      const { paginator, api } = this.getConfig();
+      const commentsResult = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
         {
           pagelen: BITBUCKET_MAX_PAGELEN,
@@ -3470,7 +3842,7 @@ class BitbucketServer {
       const publishResults = [];
       for (const comment of pendingComments) {
         try {
-          const updateResponse = await this.api.put(
+          const updateResponse = await api.put(
             `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment.id}`,
             {
               content: comment.content,
@@ -3580,7 +3952,8 @@ class BitbucketServer {
       });
 
       // Update the pull request to set draft=false
-      const response = await this.api.put(
+      const { api } = this.getConfig();
+      const response = await api.put(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`,
         {
           draft: false,
@@ -3624,7 +3997,8 @@ class BitbucketServer {
       });
 
       // Update the pull request to set draft=true
-      const response = await this.api.put(
+      const { api } = this.getConfig();
+      const response = await api.put(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`,
         {
           draft: true,
@@ -3661,7 +4035,8 @@ class BitbucketServer {
     repositoryList?: string[]
   ) {
     try {
-      const wsName = workspace || this.config.defaultWorkspace;
+      // Normalize workspace - handles any placeholder values AI might pass
+      const wsName = this.normalizeWorkspace(workspace);
       if (!wsName) {
         throw new McpError(
           ErrorCode.InvalidParams,
@@ -3669,7 +4044,8 @@ class BitbucketServer {
         );
       }
 
-      const currentUserNickname = this.config.username;
+      const { config } = this.getConfig();
+      const currentUserNickname = config.username;
       if (!currentUserNickname) {
         throw new McpError(
           ErrorCode.InvalidParams,
@@ -3695,7 +4071,8 @@ class BitbucketServer {
       } else {
         // Get all repositories in the workspace (existing behavior)
         logger.info("Getting all repositories in workspace...");
-        const reposResponse = await this.paginator.fetchValues(
+        const { paginator, api } = this.getConfig();
+        const reposResponse = await paginator.fetchValues(
           `/repositories/${wsName}`,
           {
             pagelen: BITBUCKET_MAX_PAGELEN,
@@ -3721,6 +4098,7 @@ class BitbucketServer {
       const batchSize = 5; // Process repositories in batches to avoid overwhelming the API
 
       // Process repositories in batches
+      const { api } = this.getConfig();
       for (let i = 0; i < repositoriesToCheck.length; i += batchSize) {
         const batch = repositoriesToCheck.slice(i, i + batchSize);
 
@@ -3730,7 +4108,7 @@ class BitbucketServer {
             logger.info(`Checking repository: ${repoSlug}`);
 
             // Get open PRs for this repository with participants expanded
-            const prsResponse = await this.api.get(
+            const prsResponse = await api.get(
               `/repositories/${wsName}/${repoSlug}/pullrequests`,
               {
                 params: {
@@ -3875,7 +4253,7 @@ class BitbucketServer {
       logger.info("Listing pipeline runs", {
         workspace,
         repo_slug,
-        pagelen: pagelen ?? legacyLimit,
+        pagelen: pagelen || legacyLimit,
         page,
         all,
         status,
@@ -3888,10 +4266,11 @@ class BitbucketServer {
       if (target_branch) params["target.branch"] = target_branch;
       if (trigger_type) params.trigger_type = trigger_type;
 
-      const result = await this.paginator.fetchValues(
+      const { paginator } = this.getConfig();
+      const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pipelines`,
         {
-          pagelen: pagelen ?? legacyLimit,
+          pagelen: pagelen || legacyLimit,
           page,
           all,
           params,
@@ -3934,7 +4313,8 @@ class BitbucketServer {
         pipeline_uuid,
       });
 
-      const response = await this.api.get(
+      const { api } = this.getConfig();
+      const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pipelines/${pipeline_uuid}`
       );
 
@@ -4015,7 +4395,8 @@ class BitbucketServer {
         }));
       }
 
-      const response = await this.api.post(
+      const { api } = this.getConfig();
+      const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pipelines`,
         requestData
       );
@@ -4055,7 +4436,8 @@ class BitbucketServer {
         pipeline_uuid,
       });
 
-      const response = await this.api.post(
+      const { api } = this.getConfig();
+      const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pipelines/${pipeline_uuid}/stop`
       );
 
@@ -4101,7 +4483,8 @@ class BitbucketServer {
         all,
       });
 
-      const result = await this.paginator.fetchValues(
+      const { paginator } = this.getConfig();
+      const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pipelines/${pipeline_uuid}/steps`,
         {
           pagelen,
@@ -4149,7 +4532,8 @@ class BitbucketServer {
         step_uuid,
       });
 
-      const response = await this.api.get(
+      const { api } = this.getConfig();
+      const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pipelines/${pipeline_uuid}/steps/${step_uuid}`
       );
 
@@ -4202,7 +4586,8 @@ class BitbucketServer {
         saveToFile,
       });
 
-      const response = await this.api.get(
+      const { api } = this.getConfig();
+      const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pipelines/${pipeline_uuid}/steps/${step_uuid}/log`,
         {
           maxRedirects: 5, // Follow redirects to S3
@@ -4337,7 +4722,8 @@ class BitbucketServer {
         comment_id,
       });
 
-      const response = await this.api.get(
+      const { api } = this.getConfig();
+      const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`
       );
 
@@ -4381,7 +4767,8 @@ class BitbucketServer {
         comment_id,
       });
 
-      const response = await this.api.put(
+      const { api } = this.getConfig();
+      const response = await api.put(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`,
         {
           content: { raw: content },
@@ -4424,7 +4811,8 @@ class BitbucketServer {
         comment_id,
       });
 
-      await this.api.delete(
+      const { api } = this.getConfig();
+      await api.delete(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`
       );
 
@@ -4477,7 +4865,8 @@ class BitbucketServer {
           if (visited.has(targetCommentId)) break;
           visited.add(targetCommentId);
 
-          const commentResponse = await this.api.get(
+          const { api } = this.getConfig();
+          const commentResponse = await api.get(
             commentUrl(targetCommentId)
           );
           const parentId = commentResponse.data?.parent?.id;
@@ -4499,9 +4888,10 @@ class BitbucketServer {
         targetCommentId = comment_id;
       }
 
+      const { api } = this.getConfig();
       const response = resolved
-        ? await this.api.post(resolveUrl(targetCommentId))
-        : await this.api.delete(resolveUrl(targetCommentId));
+        ? await api.post(resolveUrl(targetCommentId))
+        : await api.delete(resolveUrl(targetCommentId));
 
       const responseText =
         response.data === undefined ||
@@ -4556,7 +4946,8 @@ class BitbucketServer {
         all,
       });
 
-      const result = await this.paginator.fetchValues(
+      const { paginator } = this.getConfig();
+      const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/diffstat`,
         {
           pagelen,
@@ -4599,7 +4990,8 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      const response = await this.api.get(
+      const { api } = this.getConfig();
+      const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/patch`,
         {
           headers: { Accept: "text/plain" },
@@ -4643,7 +5035,8 @@ class BitbucketServer {
         all,
       });
 
-      const result = await this.paginator.fetchValues(
+      const { paginator } = this.getConfig();
+      const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/tasks`,
         {
           pagelen,
@@ -4693,7 +5086,8 @@ class BitbucketServer {
       if (commentId) data.comment = { id: commentId };
       if (state) data.state = state;
 
-      const response = await this.api.post(
+      const { api } = this.getConfig();
+      const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/tasks`,
         data
       );
@@ -4733,7 +5127,8 @@ class BitbucketServer {
         task_id,
       });
 
-      const response = await this.api.get(`/tasks/${task_id}`);
+      const { api } = this.getConfig();
+      const response = await api.get(`/tasks/${task_id}`);
 
       return {
         content: [
@@ -4777,7 +5172,8 @@ class BitbucketServer {
       if (content !== undefined) data.content = content;
       if (state !== undefined) data.state = state;
 
-      const response = await this.api.put(`/tasks/${task_id}`, data);
+      const { api } = this.getConfig();
+      const response = await api.put(`/tasks/${task_id}`, data);
 
       return {
         content: [
@@ -4815,7 +5211,8 @@ class BitbucketServer {
         task_id,
       });
 
-      await this.api.delete(`/tasks/${task_id}`);
+      const { api } = this.getConfig();
+      await api.delete(`/tasks/${task_id}`);
 
       return {
         content: [{ type: "text", text: "Task deleted successfully." }],
@@ -4855,7 +5252,8 @@ class BitbucketServer {
         all,
       });
 
-      const result = await this.paginator.fetchValues(
+      const { paginator } = this.getConfig();
+      const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/statuses`,
         {
           pagelen,
@@ -4897,9 +5295,643 @@ class BitbucketServer {
   }
 
   async run() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    logger.info("Bitbucket MCP server running on stdio");
+    const transportType = process.env.MCP_TRANSPORT || "stdio";
+    const port = parseInt(process.env.MCP_PORT || "3000", 10);
+
+    if (transportType === "http" || transportType === "sse") {
+      // HTTP transport mode for VS Code
+      const app = express();
+      app.use(express.json());
+
+      // CORS middleware
+      app.use((req: Request, res: Response, next) => {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+        if (req.method === "OPTIONS") {
+          res.sendStatus(200);
+          return;
+        }
+        next();
+      });
+
+      // Health check
+      app.get("/health", (req: Request, res: Response) => {
+        res.json({ status: "ok", service: "bitbucket-mcp", transport: "http" });
+      });
+
+      // MCP endpoint - handle JSON-RPC requests
+      app.post("/mcp", async (req: Request, res: Response) => {
+        try {
+          const mcpRequest = req.body;
+          
+          if (!mcpRequest || mcpRequest.jsonrpc !== "2.0") {
+            res.status(400).json({
+              jsonrpc: "2.0",
+              id: mcpRequest?.id || null,
+              error: { code: -32600, message: "Invalid Request" },
+            });
+            return;
+          }
+
+          // Access server's request handlers
+          const serverAny = this.server as any;
+          const requestHandlers = serverAny.requestHandlers || new Map();
+
+          let result: any;
+
+          if (mcpRequest.method === "initialize") {
+            // Extract configuration from multiple sources (in priority order):
+            // 1. HTTP headers (VS Code HTTP/SSE transport - supported format)
+            // 2. params.initializationOptions (other MCP clients that support it)
+            // 3. params.env (fallback)
+            // 4. Environment variables (final fallback)
+            
+            const headerConfig: Record<string, any> = {};
+            // VS Code sends config via headers (case-insensitive, but we check common variations)
+            const headerMap: Record<string, string> = {
+              "x-bitbucket-url": "BITBUCKET_URL",
+              "x-bitbucket-token": "BITBUCKET_TOKEN",
+              "x-bitbucket-username": "BITBUCKET_USERNAME",
+              "x-bitbucket-password": "BITBUCKET_PASSWORD",
+              "x-bitbucket-workspace": "BITBUCKET_WORKSPACE",
+              "x-bitbucket-enable-dangerous": "BITBUCKET_ENABLE_DANGEROUS",
+            };
+            
+            // Check all headers (Express normalizes headers to lowercase)
+            for (const [headerName, configKey] of Object.entries(headerMap)) {
+              // Express normalizes headers to lowercase, so check lowercase version
+              const headerValue = req.headers[headerName.toLowerCase()];
+              if (headerValue && typeof headerValue === "string") {
+                headerConfig[configKey] = headerValue;
+              }
+            }
+            
+            const paramsConfig: Record<string, any> = 
+              (mcpRequest.params?.initializationOptions as Record<string, any>) ||
+              (mcpRequest.params?.env as Record<string, any>) ||
+              {};
+            
+            // Merge configs: headers take precedence (VS Code), then params (other clients), then env vars
+            const clientConfig: Record<string, any> = {
+              ...paramsConfig,
+              ...headerConfig, // Headers override params
+            };
+            
+            // Use existing SSE connection ID if available, otherwise create one
+            // If no SSE connection exists yet, we'll create a timestamp-based ID
+            // but we should prefer the most recent SSE connection if one exists
+            let connectionId = req.headers["x-connection-id"] as string;
+            if (!connectionId) {
+              // Prefer existing SSE connection (most recent)
+              const existingConnections = Array.from(sseConnections.keys());
+              if (existingConnections.length > 0) {
+                connectionId = existingConnections[existingConnections.length - 1];
+              } else {
+                // No SSE connection yet, create timestamp-based ID
+                connectionId = `sse-${Date.now()}`;
+              }
+            }
+            
+            logger.info("Extracting config from initialize request", {
+              hasHeaderConfig: Object.keys(headerConfig).length > 0,
+              hasParamsConfig: Object.keys(paramsConfig).length > 0,
+              headerKeys: Object.keys(headerConfig),
+              paramsKeys: Object.keys(paramsConfig),
+              connectionId,
+            });
+            
+            const bitbucketConfig: BitbucketConfig = {
+              baseUrl: clientConfig.BITBUCKET_URL || process.env.BITBUCKET_URL || "https://api.bitbucket.org/2.0",
+              token: clientConfig.BITBUCKET_TOKEN || process.env.BITBUCKET_TOKEN,
+              username: clientConfig.BITBUCKET_USERNAME || process.env.BITBUCKET_USERNAME,
+              password: clientConfig.BITBUCKET_PASSWORD || process.env.BITBUCKET_PASSWORD,
+              defaultWorkspace: clientConfig.BITBUCKET_WORKSPACE || process.env.BITBUCKET_WORKSPACE,
+              allowDangerousCommands: clientConfig.BITBUCKET_ENABLE_DANGEROUS === "true" || clientConfig.BITBUCKET_ENABLE_DANGEROUS === true,
+            };
+            
+            // Initialize config from client (prefer client config over env)
+            if (bitbucketConfig.token || (bitbucketConfig.username && bitbucketConfig.password)) {
+              try {
+                this.initializeConfig(bitbucketConfig, "MCP client config", connectionId);
+                logger.info("Configuration initialized from MCP client", { connectionId });
+              } catch (error: any) {
+                logger.error("Failed to initialize config from client", { error: error.message, connectionId });
+                // Fall back to env if client config fails
+                this.initializeFromEnv();
+              }
+            } else {
+              // No client config, try env
+              this.initializeFromEnv();
+            }
+            
+            result = {
+              protocolVersion: "2024-11-05",
+              capabilities: { tools: {} },
+              serverInfo: { name: "bitbucket-mcp-server", version: "1.0.0" },
+            };
+          } else if (mcpRequest.method === "tools/list") {
+            if (this.listToolsHandler) {
+              result = await this.listToolsHandler();
+            } else {
+              const handler = requestHandlers.get(ListToolsRequestSchema);
+              if (handler) {
+                result = await handler(mcpRequest);
+              } else {
+                throw new McpError(ErrorCode.MethodNotFound, "tools/list handler not found");
+              }
+            }
+          } else if (mcpRequest.method === "tools/call") {
+            if (this.callToolHandler) {
+              // Use header connection ID, or most recent SSE connection, or first available
+              const sseConnectionIds = Array.from(sseConnections.keys());
+              const connectionId = req.headers["x-connection-id"] as string || 
+                (sseConnectionIds.length > 0 ? sseConnectionIds[sseConnectionIds.length - 1] : undefined);
+              result = await this.callToolHandler(mcpRequest, connectionId);
+            } else {
+              const handler = requestHandlers.get(CallToolRequestSchema);
+              if (handler) {
+                result = await handler(mcpRequest);
+              } else {
+                throw new McpError(ErrorCode.MethodNotFound, "tools/call handler not found");
+              }
+            }
+          } else {
+            throw new McpError(ErrorCode.MethodNotFound, `Unknown method: ${mcpRequest.method}`);
+          }
+
+          res.json({
+            jsonrpc: "2.0",
+            id: mcpRequest.id,
+            result,
+          });
+        } catch (error: any) {
+          logger.error("MCP request error", { ...serializeError(error), method: req.body?.method });
+          const errorResponse: any = {
+            jsonrpc: "2.0",
+            id: req.body?.id || null,
+            error: {
+              code: error.code || -32603,
+              message: error.message || "Internal error",
+            },
+          };
+          res.status(500).json(errorResponse);
+        }
+      });
+
+      // Store active SSE connections for bidirectional communication
+      const sseConnections = new Map<string, Response>();
+      // Store pending requests waiting for SSE connection
+      const pendingRequests = new Map<string, { request: any; res: Response }>();
+      let connectionCounter = 0;
+
+      // SSE endpoint for streaming (VS Code connects here)
+      app.get("/sse", (req: Request, res: Response) => {
+        const connectionId = `sse-${Date.now()}-${connectionCounter++}`;
+        
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("X-Accel-Buffering", "no");
+        
+        // Store this connection
+        sseConnections.set(connectionId, res);
+        
+        // Send initial connection message
+        res.write(`: connected\n\n`);
+        logger.info("SSE connection established", { connectionId, totalConnections: sseConnections.size });
+        
+        // Keep connection alive with more frequent heartbeats
+        const keepAlive = setInterval(() => {
+          try {
+            res.write(`: keepalive\n\n`);
+          } catch {
+            clearInterval(keepAlive);
+            sseConnections.delete(connectionId);
+          }
+        }, 15000); // More frequent keepalive (15 seconds instead of 30)
+
+        // Handle connection close
+        let isClosed = false;
+        const cleanup = () => {
+          if (!isClosed) {
+            isClosed = true;
+            clearInterval(keepAlive);
+            sseConnections.delete(connectionId);
+            logger.info("SSE connection closed", { connectionId, totalConnections: sseConnections.size });
+            try {
+              res.end();
+            } catch {
+              // Connection already closed
+            }
+          }
+        };
+
+        req.on("close", cleanup);
+        req.on("aborted", cleanup);
+        res.on("close", cleanup);
+      });
+
+      // Also handle POST to /sse (VS Code sends initialize here)
+      app.post("/sse", express.json(), async (req: Request, res: Response) => {
+        const mcpRequest = req.body;
+        logger.info("Received POST /sse", { method: mcpRequest?.method, id: mcpRequest?.id, connections: sseConnections.size });
+        
+        // Try to find any active SSE connection (VS Code might not send connection ID)
+        // Use the most recent connection if multiple exist
+        const connectionId = req.headers["x-connection-id"] as string || Array.from(sseConnections.keys())[0];
+        const sseRes = connectionId ? sseConnections.get(connectionId) : (sseConnections.size > 0 ? Array.from(sseConnections.values())[0] : null);
+        
+        logger.debug("SSE connection lookup", { connectionId, found: !!sseRes, totalConnections: sseConnections.size });
+
+        if (!mcpRequest || mcpRequest.jsonrpc !== "2.0") {
+          const errorResponse = {
+            jsonrpc: "2.0",
+            id: mcpRequest?.id || null,
+            error: { code: -32600, message: "Invalid Request" },
+          };
+          if (sseRes) {
+            sseRes.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
+            res.status(200).json({ status: "sent" });
+          } else {
+            res.status(400).json(errorResponse);
+          }
+          return;
+        }
+
+        try {
+          logger.debug("Processing MCP request via POST /sse", { method: mcpRequest.method, connectionId, hasSSE: !!sseRes });
+
+          // Handle notifications (no response needed)
+          if (mcpRequest.method === "notifications/initialized") {
+            logger.debug("Received notifications/initialized - no response needed");
+            res.status(200).json({ status: "acknowledged" });
+            return;
+          }
+
+          let result: any;
+          if (mcpRequest.method === "initialize") {
+            // Extract configuration from multiple sources (in priority order):
+            // 1. HTTP headers (VS Code HTTP/SSE transport - supported format)
+            // 2. params.initializationOptions (other MCP clients that support it)
+            // 3. params.env (fallback)
+            // 4. Environment variables (final fallback)
+            
+            const headerConfig: Record<string, any> = {};
+            // VS Code sends config via headers (case-insensitive, but we check common variations)
+            const headerMap: Record<string, string> = {
+              "x-bitbucket-url": "BITBUCKET_URL",
+              "x-bitbucket-token": "BITBUCKET_TOKEN",
+              "x-bitbucket-username": "BITBUCKET_USERNAME",
+              "x-bitbucket-password": "BITBUCKET_PASSWORD",
+              "x-bitbucket-workspace": "BITBUCKET_WORKSPACE",
+              "x-bitbucket-enable-dangerous": "BITBUCKET_ENABLE_DANGEROUS",
+            };
+            
+            // Check all headers (Express normalizes headers to lowercase)
+            for (const [headerName, configKey] of Object.entries(headerMap)) {
+              // Express normalizes headers to lowercase, so check lowercase version
+              const headerValue = req.headers[headerName.toLowerCase()];
+              if (headerValue && typeof headerValue === "string") {
+                headerConfig[configKey] = headerValue;
+              }
+            }
+            
+            const paramsConfig: Record<string, any> = 
+              (mcpRequest.params?.initializationOptions as Record<string, any>) ||
+              (mcpRequest.params?.env as Record<string, any>) ||
+              {};
+            
+            // Merge configs: headers take precedence (VS Code), then params (other clients), then env vars
+            const clientConfig: Record<string, any> = {
+              ...paramsConfig,
+              ...headerConfig, // Headers override params
+            };
+            
+            // Use existing SSE connection ID if available, otherwise create one
+            // If no SSE connection exists yet, we'll create a timestamp-based ID
+            // but we should prefer the most recent SSE connection if one exists
+            let connectionId = req.headers["x-connection-id"] as string;
+            if (!connectionId) {
+              // Prefer existing SSE connection (most recent)
+              const existingConnections = Array.from(sseConnections.keys());
+              if (existingConnections.length > 0) {
+                connectionId = existingConnections[existingConnections.length - 1];
+              } else {
+                // No SSE connection yet, create timestamp-based ID
+                connectionId = `sse-${Date.now()}`;
+              }
+            }
+            
+            logger.info("Extracting config from initialize request", {
+              hasHeaderConfig: Object.keys(headerConfig).length > 0,
+              hasParamsConfig: Object.keys(paramsConfig).length > 0,
+              headerKeys: Object.keys(headerConfig),
+              paramsKeys: Object.keys(paramsConfig),
+              connectionId,
+            });
+            
+            const bitbucketConfig: BitbucketConfig = {
+              baseUrl: clientConfig.BITBUCKET_URL || process.env.BITBUCKET_URL || "https://api.bitbucket.org/2.0",
+              token: clientConfig.BITBUCKET_TOKEN || process.env.BITBUCKET_TOKEN,
+              username: clientConfig.BITBUCKET_USERNAME || process.env.BITBUCKET_USERNAME,
+              password: clientConfig.BITBUCKET_PASSWORD || process.env.BITBUCKET_PASSWORD,
+              defaultWorkspace: clientConfig.BITBUCKET_WORKSPACE || process.env.BITBUCKET_WORKSPACE,
+              allowDangerousCommands: clientConfig.BITBUCKET_ENABLE_DANGEROUS === "true" || clientConfig.BITBUCKET_ENABLE_DANGEROUS === true,
+            };
+            
+            // Initialize config from client (prefer client config over env)
+            if (bitbucketConfig.token || (bitbucketConfig.username && bitbucketConfig.password)) {
+              try {
+                this.initializeConfig(bitbucketConfig, "MCP client config", connectionId);
+                logger.info("Configuration initialized from MCP client", { connectionId });
+              } catch (error: any) {
+                logger.error("Failed to initialize config from client", { error: error.message, connectionId });
+                // Fall back to env if client config fails
+                this.initializeFromEnv();
+              }
+            } else {
+              // No client config, try env
+              this.initializeFromEnv();
+            }
+            
+            result = {
+              protocolVersion: "2024-11-05",
+              capabilities: { tools: {} },
+              serverInfo: { name: "bitbucket-mcp-server", version: "1.0.0" },
+            };
+          } else if (mcpRequest.method === "tools/list") {
+            if (this.listToolsHandler) {
+              result = await this.listToolsHandler();
+            } else {
+              throw new McpError(ErrorCode.MethodNotFound, "tools/list handler not found");
+            }
+          } else if (mcpRequest.method === "tools/call") {
+            if (this.callToolHandler) {
+              // Use header connection ID, or most recent SSE connection, or first available
+              const sseConnectionIds = Array.from(sseConnections.keys());
+              const connectionId = req.headers["x-connection-id"] as string || 
+                (sseConnectionIds.length > 0 ? sseConnectionIds[sseConnectionIds.length - 1] : undefined);
+              result = await this.callToolHandler(mcpRequest, connectionId);
+            } else {
+              throw new McpError(ErrorCode.MethodNotFound, "tools/call handler not found");
+            }
+          } else {
+            throw new McpError(ErrorCode.MethodNotFound, `Unknown method: ${mcpRequest.method}`);
+          }
+
+          const response = {
+            jsonrpc: "2.0",
+            id: mcpRequest.id,
+            result,
+          };
+
+          if (sseRes) {
+            sseRes.write(`data: ${JSON.stringify(response)}\n\n`);
+            logger.info("Sent response via SSE", { method: mcpRequest.method, id: mcpRequest.id, connectionId });
+            res.status(200).json({ status: "sent", connectionId });
+          } else {
+            // No SSE connection yet - wait a short time for connection to be established
+            logger.warn("No SSE connection found for POST /sse, waiting briefly...", { 
+              method: mcpRequest.method, 
+              waitingConnections: sseConnections.size,
+              requestId: mcpRequest.id 
+            });
+            
+            // Wait up to 2 seconds for SSE connection to be established
+            let waited = 0;
+            let foundSSE = false;
+            while (waited < 2000 && sseConnections.size === 0) {
+              await new Promise(resolve => setTimeout(resolve, 100));
+              waited += 100;
+            }
+            
+            // Try again after waiting
+            const newConnectionId = Array.from(sseConnections.keys())[0];
+            const newSseRes = newConnectionId ? sseConnections.get(newConnectionId) : null;
+            
+            if (newSseRes) {
+              newSseRes.write(`data: ${JSON.stringify(response)}\n\n`);
+              logger.info("Sent response via SSE after waiting", { method: mcpRequest.method, id: mcpRequest.id, connectionId: newConnectionId });
+              res.status(200).json({ status: "sent", connectionId: newConnectionId });
+            } else {
+              // Still no SSE connection - return direct response as fallback
+              logger.warn("No SSE connection after waiting, returning direct response", { method: mcpRequest.method });
+              res.json(response);
+            }
+          }
+        } catch (error: any) {
+          logger.error("MCP request error", { ...serializeError(error), method: mcpRequest?.method });
+          const errorResponse: any = {
+            jsonrpc: "2.0",
+            id: mcpRequest?.id || null,
+            error: {
+              code: error.code || -32603,
+              message: error.message || "Internal error",
+            },
+          };
+          
+          if (sseRes) {
+            sseRes.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
+            res.status(200).json({ status: "error_sent" });
+          } else {
+            res.status(500).json(errorResponse);
+          }
+        }
+      });
+
+      // Message endpoint for SSE transport (VS Code sends requests here)
+      app.post("/message", express.json(), async (req: Request, res: Response) => {
+        try {
+          const mcpRequest = req.body;
+          const connectionId = req.headers["x-connection-id"] as string || Array.from(sseConnections.keys())[0];
+          const sseRes = connectionId ? sseConnections.get(connectionId) : null;
+
+          if (!mcpRequest || mcpRequest.jsonrpc !== "2.0") {
+            const errorResponse = {
+              jsonrpc: "2.0",
+              id: mcpRequest?.id || null,
+              error: { code: -32600, message: "Invalid Request" },
+            };
+            if (sseRes) {
+              sseRes.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
+            } else {
+              res.status(400).json(errorResponse);
+            }
+            return;
+          }
+
+          logger.debug("Processing MCP request via SSE", { method: mcpRequest.method, connectionId });
+
+          // Handle notifications (no response needed)
+          if (mcpRequest.method === "notifications/initialized") {
+            logger.debug("Received notifications/initialized - no response needed");
+            res.status(200).json({ status: "acknowledged" });
+            return;
+          }
+
+          // Process the request
+          let result: any;
+          if (mcpRequest.method === "initialize") {
+            // Extract configuration from multiple sources (in priority order):
+            // 1. HTTP headers (VS Code HTTP/SSE transport - supported format)
+            // 2. params.initializationOptions (other MCP clients that support it)
+            // 3. params.env (fallback)
+            // 4. Environment variables (final fallback)
+            
+            const headerConfig: Record<string, any> = {};
+            // VS Code sends config via headers (case-insensitive, but we check common variations)
+            const headerMap: Record<string, string> = {
+              "x-bitbucket-url": "BITBUCKET_URL",
+              "x-bitbucket-token": "BITBUCKET_TOKEN",
+              "x-bitbucket-username": "BITBUCKET_USERNAME",
+              "x-bitbucket-password": "BITBUCKET_PASSWORD",
+              "x-bitbucket-workspace": "BITBUCKET_WORKSPACE",
+              "x-bitbucket-enable-dangerous": "BITBUCKET_ENABLE_DANGEROUS",
+            };
+            
+            // Check all headers (Express normalizes headers to lowercase)
+            for (const [headerName, configKey] of Object.entries(headerMap)) {
+              // Express normalizes headers to lowercase, so check lowercase version
+              const headerValue = req.headers[headerName.toLowerCase()];
+              if (headerValue && typeof headerValue === "string") {
+                headerConfig[configKey] = headerValue;
+              }
+            }
+            
+            const paramsConfig: Record<string, any> = 
+              (mcpRequest.params?.initializationOptions as Record<string, any>) ||
+              (mcpRequest.params?.env as Record<string, any>) ||
+              {};
+            
+            // Merge configs: headers take precedence (VS Code), then params (other clients), then env vars
+            const clientConfig: Record<string, any> = {
+              ...paramsConfig,
+              ...headerConfig, // Headers override params
+            };
+            
+            // Use existing SSE connection ID if available, otherwise create one
+            // If no SSE connection exists yet, we'll create a timestamp-based ID
+            // but we should prefer the most recent SSE connection if one exists
+            let connectionId = req.headers["x-connection-id"] as string;
+            if (!connectionId) {
+              // Prefer existing SSE connection (most recent)
+              const existingConnections = Array.from(sseConnections.keys());
+              if (existingConnections.length > 0) {
+                connectionId = existingConnections[existingConnections.length - 1];
+              } else {
+                // No SSE connection yet, create timestamp-based ID
+                connectionId = `sse-${Date.now()}`;
+              }
+            }
+            
+            logger.info("Extracting config from initialize request", {
+              hasHeaderConfig: Object.keys(headerConfig).length > 0,
+              hasParamsConfig: Object.keys(paramsConfig).length > 0,
+              headerKeys: Object.keys(headerConfig),
+              paramsKeys: Object.keys(paramsConfig),
+              connectionId,
+            });
+            
+            const bitbucketConfig: BitbucketConfig = {
+              baseUrl: clientConfig.BITBUCKET_URL || process.env.BITBUCKET_URL || "https://api.bitbucket.org/2.0",
+              token: clientConfig.BITBUCKET_TOKEN || process.env.BITBUCKET_TOKEN,
+              username: clientConfig.BITBUCKET_USERNAME || process.env.BITBUCKET_USERNAME,
+              password: clientConfig.BITBUCKET_PASSWORD || process.env.BITBUCKET_PASSWORD,
+              defaultWorkspace: clientConfig.BITBUCKET_WORKSPACE || process.env.BITBUCKET_WORKSPACE,
+              allowDangerousCommands: clientConfig.BITBUCKET_ENABLE_DANGEROUS === "true" || clientConfig.BITBUCKET_ENABLE_DANGEROUS === true,
+            };
+            
+            // Initialize config from client (prefer client config over env)
+            if (bitbucketConfig.token || (bitbucketConfig.username && bitbucketConfig.password)) {
+              try {
+                this.initializeConfig(bitbucketConfig, "MCP client config", connectionId);
+                logger.info("Configuration initialized from MCP client", { connectionId });
+              } catch (error: any) {
+                logger.error("Failed to initialize config from client", { error: error.message, connectionId });
+                // Fall back to env if client config fails
+                this.initializeFromEnv();
+              }
+            } else {
+              // No client config, try env
+              this.initializeFromEnv();
+            }
+            
+            result = {
+              protocolVersion: "2024-11-05",
+              capabilities: { tools: {} },
+              serverInfo: { name: "bitbucket-mcp-server", version: "1.0.0" },
+            };
+          } else if (mcpRequest.method === "tools/list") {
+            if (this.listToolsHandler) {
+              result = await this.listToolsHandler();
+            } else {
+              throw new McpError(ErrorCode.MethodNotFound, "tools/list handler not found");
+            }
+          } else if (mcpRequest.method === "tools/call") {
+            if (this.callToolHandler) {
+              // Use header connection ID, or most recent SSE connection, or first available
+              const sseConnectionIds = Array.from(sseConnections.keys());
+              const connectionId = req.headers["x-connection-id"] as string || 
+                (sseConnectionIds.length > 0 ? sseConnectionIds[sseConnectionIds.length - 1] : undefined);
+              result = await this.callToolHandler(mcpRequest, connectionId);
+            } else {
+              throw new McpError(ErrorCode.MethodNotFound, "tools/call handler not found");
+            }
+          } else {
+            throw new McpError(ErrorCode.MethodNotFound, `Unknown method: ${mcpRequest.method}`);
+          }
+
+          // Send response via SSE stream
+          const response = {
+            jsonrpc: "2.0",
+            id: mcpRequest.id,
+            result,
+          };
+
+          if (sseRes) {
+            sseRes.write(`data: ${JSON.stringify(response)}\n\n`);
+            res.status(200).json({ status: "sent" });
+          } else {
+            // Fallback to direct HTTP response if no SSE connection
+            res.json(response);
+          }
+        } catch (error: any) {
+          logger.error("MCP request error", { ...serializeError(error), method: req.body?.method });
+          const errorResponse: any = {
+            jsonrpc: "2.0",
+            id: req.body?.id || null,
+            error: {
+              code: error.code || -32603,
+              message: error.message || "Internal error",
+            },
+          };
+          
+          const connectionId = req.headers["x-connection-id"] as string || Array.from(sseConnections.keys())[0];
+          const sseRes = connectionId ? sseConnections.get(connectionId) : null;
+          
+          if (sseRes) {
+            sseRes.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
+            res.status(200).json({ status: "error_sent" });
+          } else {
+            res.status(500).json(errorResponse);
+          }
+        }
+      });
+
+      app.listen(port, "localhost", () => {
+        logger.info(`Bitbucket MCP HTTP server listening on http://localhost:${port}`);
+        logger.info(`MCP endpoint: http://localhost:${port}/mcp`);
+        logger.info(`SSE endpoint: http://localhost:${port}/sse`);
+        logger.info(`Health check: http://localhost:${port}/health`);
+      });
+    } else {
+      // Stdio transport mode (default)
+      const transport = new StdioServerTransport();
+      await this.server.connect(transport);
+      logger.info("Bitbucket MCP server running on stdio");
+    }
   }
 }
 

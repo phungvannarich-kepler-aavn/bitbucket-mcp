@@ -96,27 +96,101 @@ Configure the server using the following environment variables:
 | Variable                     | Description                                                                    | Required |
 | ---------------------------- | ------------------------------------------------------------------------------ | -------- |
 | `BITBUCKET_URL`              | Bitbucket API base URL. Defaults to `https://api.bitbucket.org/2.0`            | No       |
-| `BITBUCKET_USERNAME`         | Your Bitbucket username                                                        | Yes\*    |
-| `BITBUCKET_PASSWORD`         | Your Bitbucket app password                                                    | Yes\*    |
-| `BITBUCKET_TOKEN`            | Your Bitbucket access token (alternative to username/password)                 | No       |
+| `BITBUCKET_TOKEN`            | **Recommended:** Your Bitbucket API token (no mobile verification needed)      | Yes\*    |
+| `BITBUCKET_USERNAME`         | Your Bitbucket username/email (only if using password auth)                    | No       |
+| `BITBUCKET_PASSWORD`         | Your Bitbucket app password (requires mobile verification - not recommended)   | No       |
 | `BITBUCKET_WORKSPACE`        | Default workspace to use. If omitted and `BITBUCKET_URL` contains it, auto-set | No       |
 | `BITBUCKET_ENABLE_DANGEROUS` | Set to `true` to enable dangerous tools (e.g., deletions). Default: disabled   | No       |
+| `MCP_TRANSPORT`              | Transport type: `stdio` (default) or `http` for HTTP server mode               | No       |
+| `MCP_PORT`                   | Port for HTTP server (default: 3000). Only used when `MCP_TRANSPORT=http`     | No       |
 | `BITBUCKET_LOG_DISABLE`      | Disable file logging when set to `true`/`1`                                    | No       |
 | `BITBUCKET_LOG_FILE`         | Absolute path to a specific log file                                           | No       |
 | `BITBUCKET_LOG_DIR`          | Directory to store logs (defaults to OS-specific app log dir)                  | No       |
 | `BITBUCKET_LOG_PER_CWD`      | When `true`, nest logs under a per-working-directory subfolder                 | No       |
 
-Either `BITBUCKET_TOKEN` or both `BITBUCKET_USERNAME` and `BITBUCKET_PASSWORD` must be provided.
+**Authentication:** Either `BITBUCKET_TOKEN` (recommended) or both `BITBUCKET_USERNAME` and `BITBUCKET_PASSWORD` must be provided.
 
-### Creating a Bitbucket App Password
+**⚠️ Important:** `BITBUCKET_TOKEN` is strongly recommended as it doesn't require mobile app verification. Username/password authentication may require 2FA verification on your mobile device.
+
+**📝 Client-Side Configuration (Recommended):** Configuration can now be provided through the MCP client config file (`initializationOptions`) instead of environment variables. See [Client Configuration Guide](./CLIENT_CONFIG_GUIDE.md) for details.
+
+### Creating a Bitbucket API Token (Recommended)
+
+**API tokens are preferred** as they don't require mobile app verification. Here's how to get one:
+
+#### Step-by-Step Instructions:
+
+1. **Log in to Bitbucket Cloud**
+   - Go to https://bitbucket.org and sign in
+
+2. **Navigate to Atlassian Account Settings**
+   - Click your profile avatar (top right)
+   - Select **Personal settings**
+   - Click **Atlassian account settings** (or go directly to https://id.atlassian.com/manage-profile/security/api-tokens)
+
+3. **Create API Token**
+   - Click the **Security** tab
+   - Scroll down to **"Create and manage API tokens"**
+   - Click **Create API token**
+
+4. **Configure the Token**
+   - **Label**: Give it a descriptive name (e.g., "MCP Server" or "VS Code Integration")
+   - **Expiry**: Set an expiration date (optional, recommended for security)
+   - **Permissions**: Select the minimum scopes needed:
+     - ✅ **`repository:read`** - Required for reading repositories
+     - ✅ **`repository:write`** - Required for creating/updating PRs
+     - ✅ **`pullrequest:read`** - Required for reading pull requests
+     - ✅ **`pullrequest:write`** - Required for creating/updating PRs
+     - ✅ **`pipeline:read`** - Required for reading pipeline logs
+
+5. **Copy the Token**
+   - Click **Create token**
+   - **⚠️ IMPORTANT**: Copy the token immediately - you won't be able to see it again!
+   - Store it securely (password manager, environment variable, etc.)
+
+6. **Use the Token**
+   - Set it as the `BITBUCKET_TOKEN` environment variable
+   - Example: `BITBUCKET_TOKEN="ATATT3xFfGF0..."`
+
+#### Quick Link:
+- Direct link to create API tokens: https://id.atlassian.com/manage-profile/security/api-tokens
+
+#### Alternative: Using App Passwords (Legacy)
+
+If you're using the older App Passwords method:
+1. Go to https://bitbucket.org/account/settings/app-passwords/
+2. Click **Create app password**
+3. Select permissions and create
+4. **Note**: App passwords are being deprecated and may require mobile verification
+
+**Note:** API tokens are scoped, can be revoked at any time, and don't require 2FA mobile verification. They're the recommended authentication method going forward.
+
+### Testing API Token Authentication
+
+To test your API token works correctly:
+
+```bash
+# Test with curl using API token (replace YOUR_API_TOKEN and your-workspace)
+curl -H "Authorization: Bearer YOUR_API_TOKEN" \
+  "https://api.bitbucket.org/2.0/repositories/your-workspace"
+```
+
+You should see a JSON response with your repositories. If you get a `401 Unauthorized` error, check:
+- The token was copied correctly (no extra spaces)
+- The token hasn't expired
+- The token has the required scopes/permissions
+
+### Alternative: Using App Password (Legacy - Not Recommended)
+
+If you must use username/password authentication (legacy method):
 
 1. Log in to your Bitbucket account
-2. Go to Personal Settings > App Passwords
-3. Create a new app password with the following permissions:
-   - Repositories: Read
-   - Pull requests: Read, Write
-   - Pipelines: Read (required for pipeline operations)
-4. Copy the generated password and use it as the `BITBUCKET_PASSWORD` environment variable
+2. Go to Personal Settings > App Passwords (https://bitbucket.org/account/settings/app-passwords/)
+3. Create a new app password with the required permissions
+4. **Note:** You may be prompted for mobile app verification
+5. Use `BITBUCKET_USERNAME` (your email) and `BITBUCKET_PASSWORD` (the app password)
+
+**⚠️ Warning:** App passwords are being deprecated and will be disabled in June 2026. Use API tokens instead.
 
 ## Troubleshooting
 
@@ -140,7 +214,19 @@ curl -u "your-username:your-app-password" \
   "https://api.bitbucket.org/2.0/repositories/your-workspace"
 ```
 
-### Atlassian API Key 
+### Testing API Token Authentication
+
+To test your API token:
+
+```bash
+# Test with curl using API token
+curl -H "Authorization: Bearer YOUR_API_TOKEN" \
+  "https://api.bitbucket.org/2.0/repositories/your-workspace"
+```
+
+### Atlassian API Key (Legacy)
+
+If you're using an Atlassian API Key instead of a Bitbucket API token:
 
 1. Put the Atlassian API Key in the `BITBUCKET_PASSWORD` variable, not `BITBUCKET_TOKEN`
 2. Use your Bitbucket email as `BITBUCKET_USERNAME` instead of your regular username
@@ -153,6 +239,127 @@ If you encounter issues:
 
 1. Check the [Bitbucket REST API documentation](https://developer.atlassian.com/cloud/bitbucket/rest/intro/) for API details
 2. Review the [Bitbucket Cloud documentation](https://support.atlassian.com/bitbucket-cloud/) for general help
+
+## Running as HTTP Server (for VS Code)
+
+To run the MCP server as an HTTP server for VS Code or other HTTP-based MCP clients:
+
+### 1. Start the HTTP Server
+
+**Option A: Using the provided scripts (Recommended)**
+
+**Windows (PowerShell):**
+```powershell
+.\start-http-server.ps1
+```
+
+**Linux/Mac (Bash):**
+```bash
+./start-http-server.sh
+```
+
+**Option B: Manual start**
+
+```bash
+MCP_TRANSPORT=http MCP_PORT=3000 node dist/index.js
+```
+
+The server will start on `http://localhost:3000` with the following endpoints:
+- `POST /mcp` - MCP protocol endpoint
+- `GET /health` - Health check endpoint
+- `GET /sse` - Server-Sent Events endpoint (for streaming)
+- `POST /sse` - SSE message endpoint
+- `POST /message` - Alternative message endpoint
+
+### 2. Configure VS Code
+
+**⚠️ Important:** Configuration is now provided through the MCP client config file, not environment variables!
+
+Create `.vscode/mcp.json` in your workspace:
+
+```json
+{
+  "servers": {
+    "bitbucket-mcp": {
+      "type": "http",
+      "url": "http://localhost:3000/sse",
+      "headers": {
+        "X-Bitbucket-URL": "https://api.bitbucket.org/2.0",
+        "X-Bitbucket-Token": "YOUR_API_TOKEN_HERE",
+        "X-Bitbucket-Username": "your-email@example.com",
+        "X-Bitbucket-Workspace": "your-workspace",
+        "X-Bitbucket-Enable-Dangerous": "false"
+      }
+    }
+  }
+}
+```
+
+**⚠️ Important:** VS Code's HTTP MCP client does NOT support `initializationOptions`. You must use the `headers` field. This is the only supported method according to [VS Code's MCP documentation](https://code.visualstudio.com/docs/copilot/customization/mcp-servers).
+
+**Key points:**
+- Use `"url": "http://localhost:3000/sse"` for SSE transport (recommended)
+- Configuration goes in `headers` with `X-Bitbucket-` prefix (VS Code requirement)
+- The server must be started separately (via `start-http-server.ps1` or `start-http-server.sh`) with `MCP_TRANSPORT=http` and `MCP_PORT=3000`
+- Environment variables are optional fallback only
+- See [Client Configuration Guide](./CLIENT_CONFIG_GUIDE.md) for detailed instructions
+
+### Using Input Variables (Recommended for Security)
+
+For better security, use VS Code's input variables:
+
+```json
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "bitbucket-token",
+      "description": "Bitbucket API Token",
+      "password": true
+    },
+    {
+      "type": "promptString",
+      "id": "bitbucket-username",
+      "description": "Your Atlassian Account Email"
+    }
+  ],
+  "servers": {
+    "bitbucket-mcp": {
+      "type": "http",
+      "url": "http://localhost:3000/sse",
+      "headers": {
+        "X-Bitbucket-URL": "https://api.bitbucket.org/2.0",
+        "X-Bitbucket-Token": "${input:bitbucket-token}",
+        "X-Bitbucket-Username": "${input:bitbucket-username}",
+        "X-Bitbucket-Workspace": "your-workspace"
+      }
+    }
+  }
+}
+```
+
+Or configure globally:
+1. Open Command Palette (Ctrl+Shift+P / Cmd+Shift+P)
+2. Run: `MCP: Add Server`
+3. Select "HTTP" type
+4. Enter URL: `http://localhost:3000/sse`
+5. Add configuration in `initializationOptions`
+
+### 3. Verify Connection
+
+Check the health endpoint:
+```bash
+curl http://localhost:3000/health
+```
+
+You should see:
+```json
+{
+  "status": "ok",
+  "service": "bitbucket-mcp",
+  "transport": "http"
+}
+```
 
 ## Integration with Cursor
 

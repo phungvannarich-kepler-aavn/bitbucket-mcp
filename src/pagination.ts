@@ -160,7 +160,23 @@ export class BitbucketPaginator {
       ...extra,
     });
     const config = request.params ? { params: request.params } : undefined;
-    return this.api.get(request.url, config);
+    try {
+      return await this.api.get(request.url, config);
+    } catch (error: any) {
+      // Enhanced error logging for authentication issues
+      if (error.response?.status === 401) {
+        this.logger.error("Bitbucket API authentication failed (401)", {
+          url: request.url,
+          description: description ?? request.url,
+          status: error.response.status,
+          statusText: error.response.statusText,
+          responseData: error.response.data,
+          hasAuthHeader: !!error.config?.headers?.Authorization,
+          authHeaderPrefix: error.config?.headers?.Authorization?.substring(0, 10),
+        });
+      }
+      throw error;
+    }
   }
 
   private extractValues<T>(data: any): T[] {
