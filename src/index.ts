@@ -824,6 +824,40 @@ class BitbucketServer {
       }
     }
     
+    // If no clientId provided but we have client configs, use the most recent one
+    // This handles cases where methods don't pass connectionId yet
+    if (!clientId && this.clientConfigs.size > 0) {
+      const configs = Array.from(this.clientConfigs.entries());
+      if (configs.length > 0) {
+        const [mostRecentId, mostRecentConfig] = configs[configs.length - 1];
+        logger.debug("No connectionId provided, using most recent client config", {
+          usingId: mostRecentId,
+          totalConfigs: this.clientConfigs.size,
+        });
+        
+        const headers: Record<string, string> = {};
+        let authConfig: { username: string; password: string } | undefined;
+        
+        if (mostRecentConfig.token && mostRecentConfig.username) {
+          authConfig = { username: mostRecentConfig.username, password: mostRecentConfig.token };
+        } else if (mostRecentConfig.username && mostRecentConfig.password) {
+          authConfig = { username: mostRecentConfig.username, password: mostRecentConfig.password };
+        }
+        
+        const api = axios.create({
+          baseURL: mostRecentConfig.baseUrl,
+          headers,
+          auth: authConfig,
+        });
+        
+        return {
+          config: mostRecentConfig,
+          api,
+          paginator: new BitbucketPaginator(api, logger),
+        };
+      }
+    }
+    
     if (!this.config || !this.api || !this.paginator) {
       throw new Error(
         "Bitbucket configuration not initialized. Please provide configuration in MCP client config or environment variables."
@@ -2173,7 +2207,8 @@ class BitbucketServer {
           case "getRepository":
             return await this.getRepository(
               args.workspace as string,
-              args.repo_slug as string
+              args.repo_slug as string,
+              connectionId
             );
           case "getPullRequests":
             return await this.getPullRequests(
@@ -2183,7 +2218,8 @@ class BitbucketServer {
               args.pagelen as number,
               args.page as number,
               args.all as boolean,
-              args.limit as number
+              args.limit as number,
+              connectionId
             );
           case "createPullRequest":
             return await this.createPullRequest(
@@ -2194,13 +2230,15 @@ class BitbucketServer {
               args.sourceBranch as string,
               args.targetBranch as string,
               args.reviewers as string[] | undefined,
-              args.draft as boolean
+              args.draft as boolean,
+              connectionId
             );
           case "getPullRequest":
             return await this.getPullRequest(
               args.workspace as string,
               args.repo_slug as string,
-              args.pull_request_id as string
+              args.pull_request_id as string,
+              connectionId
             );
           case "updatePullRequest":
             return await this.updatePullRequest(
@@ -2208,7 +2246,8 @@ class BitbucketServer {
               args.repo_slug as string,
               args.pull_request_id as string,
               args.title as string,
-              args.description as string
+              args.description as string,
+              connectionId
             );
           case "getPullRequestActivity":
             return await this.getPullRequestActivity(
@@ -2217,26 +2256,30 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              connectionId
             );
           case "approvePullRequest":
             return await this.approvePullRequest(
               args.workspace as string,
               args.repo_slug as string,
-              args.pull_request_id as string
+              args.pull_request_id as string,
+              connectionId
             );
           case "unapprovePullRequest":
             return await this.unapprovePullRequest(
               args.workspace as string,
               args.repo_slug as string,
-              args.pull_request_id as string
+              args.pull_request_id as string,
+              connectionId
             );
           case "declinePullRequest":
             return await this.declinePullRequest(
               args.workspace as string,
               args.repo_slug as string,
               args.pull_request_id as string,
-              args.message as string
+              args.message as string,
+              connectionId
             );
           case "mergePullRequest":
             return await this.mergePullRequest(
@@ -2244,7 +2287,8 @@ class BitbucketServer {
               args.repo_slug as string,
               args.pull_request_id as string,
               args.message as string,
-              args.strategy as "merge-commit" | "squash" | "fast-forward"
+              args.strategy as "merge-commit" | "squash" | "fast-forward",
+              connectionId
             );
           case "getPullRequestComments":
             return await this.getPullRequestComments(
@@ -2253,13 +2297,15 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              connectionId
             );
           case "getPullRequestDiff":
             return await this.getPullRequestDiff(
               args.workspace as string,
               args.repo_slug as string,
-              args.pull_request_id as string
+              args.pull_request_id as string,
+              connectionId
             );
           case "getPullRequestCommits":
             return await this.getPullRequestCommits(
@@ -2268,7 +2314,8 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              connectionId
             );
           case "addPullRequestComment":
             return await this.addPullRequestComment(
@@ -2277,7 +2324,8 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.content as string,
               args.inline as InlineCommentInline,
-              args.pending as boolean
+              args.pending as boolean,
+              connectionId
             );
           case "addPendingPullRequestComment":
             return await this.addPendingPullRequestComment(
@@ -2291,17 +2339,20 @@ class BitbucketServer {
             return await this.publishPendingComments(
               args.workspace as string,
               args.repo_slug as string,
-              args.pull_request_id as string
+              args.pull_request_id as string,
+              connectionId
             );
           case "getRepositoryBranchingModel":
             return await this.getRepositoryBranchingModel(
               args.workspace as string,
-              args.repo_slug as string
+              args.repo_slug as string,
+              connectionId
             );
           case "getRepositoryBranchingModelSettings":
             return await this.getRepositoryBranchingModelSettings(
               args.workspace as string,
-              args.repo_slug as string
+              args.repo_slug as string,
+              connectionId
             );
           case "updateRepositoryBranchingModelSettings":
             return await this.updateRepositoryBranchingModelSettings(
@@ -2309,22 +2360,26 @@ class BitbucketServer {
               args.repo_slug as string,
               args.development as Record<string, any>,
               args.production as Record<string, any>,
-              args.branch_types as Array<Record<string, any>>
+              args.branch_types as Array<Record<string, any>>,
+              connectionId
             );
           case "getEffectiveRepositoryBranchingModel":
             return await this.getEffectiveRepositoryBranchingModel(
               args.workspace as string,
-              args.repo_slug as string
+              args.repo_slug as string,
+              connectionId
             );
           case "getProjectBranchingModel":
             return await this.getProjectBranchingModel(
               args.workspace as string,
-              args.project_key as string
+              args.project_key as string,
+              connectionId
             );
           case "getProjectBranchingModelSettings":
             return await this.getProjectBranchingModelSettings(
               args.workspace as string,
-              args.project_key as string
+              args.project_key as string,
+              connectionId
             );
           case "updateProjectBranchingModelSettings":
             return await this.updateProjectBranchingModelSettings(
@@ -2332,7 +2387,8 @@ class BitbucketServer {
               args.project_key as string,
               args.development as Record<string, any>,
               args.production as Record<string, any>,
-              args.branch_types as Array<Record<string, any>>
+              args.branch_types as Array<Record<string, any>>,
+              connectionId
             );
           case "createDraftPullRequest":
             return await this.createDraftPullRequest(
@@ -2342,25 +2398,29 @@ class BitbucketServer {
               args.description as string,
               args.sourceBranch as string,
               args.targetBranch as string,
-              args.reviewers as string[]
+              args.reviewers as string[],
+              connectionId
             );
           case "publishDraftPullRequest":
             return await this.publishDraftPullRequest(
               args.workspace as string,
               args.repo_slug as string,
-              args.pull_request_id as string
+              args.pull_request_id as string,
+              connectionId
             );
           case "convertTodraft":
             return await this.convertTodraft(
               args.workspace as string,
               args.repo_slug as string,
-              args.pull_request_id as string
+              args.pull_request_id as string,
+              connectionId
             );
           case "getPendingReviewPRs":
             return await this.getPendingReviewPRs(
               args.workspace as string | undefined,
               args.limit as number,
-              args.repositoryList as string[]
+              args.repositoryList as string[],
+              connectionId
             );
           case "listPipelineRuns":
             return await this.listPipelineRuns(
@@ -2388,20 +2448,23 @@ class BitbucketServer {
             return await this.getPipelineRun(
               args.workspace as string,
               args.repo_slug as string,
-              args.pipeline_uuid as string
+              args.pipeline_uuid as string,
+              connectionId
             );
           case "runPipeline":
             return await this.runPipeline(
               args.workspace as string,
               args.repo_slug as string,
               args.target as any,
-              args.variables as any[]
+              args.variables as any[],
+              connectionId
             );
           case "stopPipeline":
             return await this.stopPipeline(
               args.workspace as string,
               args.repo_slug as string,
-              args.pipeline_uuid as string
+              args.pipeline_uuid as string,
+              connectionId
             );
           case "getPipelineSteps":
             return await this.getPipelineSteps(
@@ -2410,14 +2473,16 @@ class BitbucketServer {
               args.pipeline_uuid as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              connectionId
             );
           case "getPipelineStep":
             return await this.getPipelineStep(
               args.workspace as string,
               args.repo_slug as string,
               args.pipeline_uuid as string,
-              args.step_uuid as string
+              args.step_uuid as string,
+              connectionId
             );
           case "getPipelineStepLogs":
             return await this.getPipelineStepLogs(
@@ -2429,14 +2494,16 @@ class BitbucketServer {
               args.tail as boolean | undefined,
               args.errors_only as boolean | undefined,
               args.search_term as string | undefined,
-              args.save_to_file as boolean | undefined
+              args.save_to_file as boolean | undefined,
+              connectionId
             );
           case "getPullRequestComment":
             return await this.getPullRequestComment(
               args.workspace as string,
               args.repo_slug as string,
               args.pull_request_id as string,
-              args.comment_id as string
+              args.comment_id as string,
+              connectionId
             );
           case "updatePullRequestComment":
             return await this.updatePullRequestComment(
@@ -2444,14 +2511,16 @@ class BitbucketServer {
               args.repo_slug as string,
               args.pull_request_id as string,
               args.comment_id as string,
-              args.content as string
+              args.content as string,
+              connectionId
             );
           case "deletePullRequestComment":
             return await this.deletePullRequestComment(
               args.workspace as string,
               args.repo_slug as string,
               args.pull_request_id as string,
-              args.comment_id as string
+              args.comment_id as string,
+              connectionId
             );
           case "resolveComment":
             return await this.setCommentResolved(
@@ -2459,7 +2528,8 @@ class BitbucketServer {
               args.repo_slug as string,
               args.pull_request_id as string,
               args.comment_id as string,
-              true
+              true,
+              connectionId
             );
           case "reopenComment":
             return await this.setCommentResolved(
@@ -2467,7 +2537,8 @@ class BitbucketServer {
               args.repo_slug as string,
               args.pull_request_id as string,
               args.comment_id as string,
-              false
+              false,
+              connectionId
             );
           case "getPullRequestDiffStat":
             return await this.getPullRequestDiffStat(
@@ -2476,13 +2547,15 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              connectionId
             );
           case "getPullRequestPatch":
             return await this.getPullRequestPatch(
               args.workspace as string,
               args.repo_slug as string,
-              args.pull_request_id as string
+              args.pull_request_id as string,
+              connectionId
             );
           case "getPullRequestTasks":
             return await this.getPullRequestTasks(
@@ -2491,7 +2564,8 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              connectionId
             );
           case "createPullRequestTask":
             return await this.createPullRequestTask(
@@ -2500,14 +2574,16 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.content as string,
               args.comment as number,
-              args.state as "OPEN" | "RESOLVED"
+              args.state as "OPEN" | "RESOLVED",
+              connectionId
             );
           case "getPullRequestTask":
             return await this.getPullRequestTask(
               args.workspace as string,
               args.repo_slug as string,
               args.pull_request_id as string,
-              args.task_id as string
+              args.task_id as string,
+              connectionId
             );
           case "updatePullRequestTask":
             return await this.updatePullRequestTask(
@@ -2516,14 +2592,16 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.task_id as string,
               args.content as string | undefined,
-              args.state as ("OPEN" | "RESOLVED") | undefined
+              args.state as ("OPEN" | "RESOLVED") | undefined,
+              connectionId
             );
           case "deletePullRequestTask":
             return await this.deletePullRequestTask(
               args.workspace as string,
               args.repo_slug as string,
               args.pull_request_id as string,
-              args.task_id as string
+              args.task_id as string,
+              connectionId
             );
           case "getPullRequestStatuses":
             return await this.getPullRequestStatuses(
@@ -2532,12 +2610,14 @@ class BitbucketServer {
               args.pull_request_id as string,
               args.pagelen as number,
               args.page as number,
-              args.all as boolean
+              args.all as boolean,
+              connectionId
             );
           case "getEffectiveDefaultReviewers":
             return await this.getEffectiveDefaultReviewers(
               args.workspace as string,
-              args.repo_slug as string
+              args.repo_slug as string,
+              connectionId
             );
           default:
             throw new McpError(
@@ -2692,9 +2772,9 @@ class BitbucketServer {
     }
   }
 
-  async getRepository(workspace: string, repo_slug: string) {
+  async getRepository(workspace: string, repo_slug: string, connectionId?: string) {
     try {
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       logger.info("Getting Bitbucket repository info", {
         workspace,
         repo_slug,
@@ -2723,9 +2803,9 @@ class BitbucketServer {
     }
   }
 
-  async getEffectiveDefaultReviewers(workspace: string, repo_slug: string) {
+  async getEffectiveDefaultReviewers(workspace: string, repo_slug: string, connectionId?: string) {
     try {
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       logger.info("Getting effective default reviewers", {
         workspace,
         repo_slug,
@@ -2765,7 +2845,8 @@ class BitbucketServer {
     pagelen?: number,
     page?: number,
     all?: boolean,
-    legacyLimit?: number
+    legacyLimit?: number,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting Bitbucket pull requests", {
@@ -2782,7 +2863,7 @@ class BitbucketServer {
         params.state = state;
       }
 
-      const { paginator } = this.getConfig();
+      const { paginator } = this.getConfig(connectionId);
       const result = await paginator.fetchValues<BitbucketPullRequest>(
         `/repositories/${workspace}/${repo_slug}/pullrequests`,
         {
@@ -2825,10 +2906,11 @@ class BitbucketServer {
     sourceBranch: string,
     targetBranch: string,
     reviewers?: string[],
-    draft?: boolean
+    draft?: boolean,
+    connectionId?: string
   ) {
     try {
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       logger.info("Creating Bitbucket pull request", {
         workspace,
         repo_slug,
@@ -2912,7 +2994,8 @@ class BitbucketServer {
   async getPullRequest(
     workspace: string,
     repo_slug: string,
-    pull_request_id: string
+    pull_request_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting Bitbucket pull request details", {
@@ -2921,7 +3004,7 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`
       );
@@ -2955,7 +3038,8 @@ class BitbucketServer {
     repo_slug: string,
     pull_request_id: string,
     title?: string,
-    description?: string
+    description?: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Updating Bitbucket pull request", {
@@ -2969,7 +3053,7 @@ class BitbucketServer {
       if (title !== undefined) updateData.title = title;
       if (description !== undefined) updateData.description = description;
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.put(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`,
         updateData
@@ -2985,7 +3069,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error updating pull request", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -3005,7 +3089,8 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting Bitbucket pull request activity", {
@@ -3017,7 +3102,7 @@ class BitbucketServer {
         all,
       });
 
-      const { paginator } = this.getConfig();
+      const { paginator } = this.getConfig(connectionId);
       const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/activity`,
         {
@@ -3038,7 +3123,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pull request activity", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -3055,7 +3140,8 @@ class BitbucketServer {
   async approvePullRequest(
     workspace: string,
     repo_slug: string,
-    pull_request_id: string
+    pull_request_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Approving Bitbucket pull request", {
@@ -3064,7 +3150,7 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/approve`
       );
@@ -3079,7 +3165,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error approving pull request", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -3096,7 +3182,8 @@ class BitbucketServer {
   async unapprovePullRequest(
     workspace: string,
     repo_slug: string,
-    pull_request_id: string
+    pull_request_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Unapproving Bitbucket pull request", {
@@ -3105,7 +3192,7 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.delete(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/approve`
       );
@@ -3120,7 +3207,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error unapproving pull request", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -3138,7 +3225,8 @@ class BitbucketServer {
     workspace: string,
     repo_slug: string,
     pull_request_id: string,
-    message?: string
+    message?: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Declining Bitbucket pull request", {
@@ -3150,7 +3238,7 @@ class BitbucketServer {
       // Include message if provided
       const data = message ? { message } : {};
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/decline`,
         data
@@ -3166,7 +3254,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error declining pull request", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -3185,7 +3273,8 @@ class BitbucketServer {
     repo_slug: string,
     pull_request_id: string,
     message?: string,
-    strategy?: "merge-commit" | "squash" | "fast-forward"
+    strategy?: "merge-commit" | "squash" | "fast-forward",
+    connectionId?: string
   ) {
     try {
       logger.info("Merging Bitbucket pull request", {
@@ -3200,7 +3289,7 @@ class BitbucketServer {
       if (message) data.message = message;
       if (strategy) data.merge_strategy = strategy;
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/merge`,
         data
@@ -3216,7 +3305,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error merging pull request", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -3236,7 +3325,8 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting Bitbucket pull request comments", {
@@ -3248,7 +3338,7 @@ class BitbucketServer {
         all,
       });
 
-      const { paginator } = this.getConfig();
+      const { paginator } = this.getConfig(connectionId);
       const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
         {
@@ -3269,7 +3359,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pull request comments", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -3286,7 +3376,8 @@ class BitbucketServer {
   async getPullRequestDiff(
     workspace: string,
     repo_slug: string,
-    pull_request_id: string
+    pull_request_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting Bitbucket pull request diff", {
@@ -3296,7 +3387,7 @@ class BitbucketServer {
       });
 
       // First get the pull request details to extract commit information
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const prResponse = await api.get(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`
       );
@@ -3326,7 +3417,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pull request diff", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -3346,7 +3437,8 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting Bitbucket pull request commits", {
@@ -3358,7 +3450,7 @@ class BitbucketServer {
         all,
       });
 
-      const { paginator } = this.getConfig();
+      const { paginator } = this.getConfig(connectionId);
       const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/commits`,
         {
@@ -3379,7 +3471,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pull request commits", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -3399,7 +3491,8 @@ class BitbucketServer {
     pull_request_id: string,
     content: string,
     inline?: InlineCommentInline,
-    pending?: boolean
+    pending?: boolean,
+    connectionId?: string
   ) {
     try {
       logger.info("Adding comment to Bitbucket pull request", {
@@ -3436,7 +3529,7 @@ class BitbucketServer {
         }
       }
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
         commentData
@@ -3452,7 +3545,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error adding comment to pull request", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -3466,9 +3559,9 @@ class BitbucketServer {
     }
   }
 
-  async getRepositoryBranchingModel(workspace: string, repo_slug: string) {
+  async getRepositoryBranchingModel(workspace: string, repo_slug: string, connectionId?: string) {
     try {
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       logger.info("Getting repository branching model", {
         workspace,
         repo_slug,
@@ -3488,7 +3581,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting repository branching model", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
       });
@@ -3503,7 +3596,8 @@ class BitbucketServer {
 
   async getRepositoryBranchingModelSettings(
     workspace: string,
-    repo_slug: string
+    repo_slug: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting repository branching model settings", {
@@ -3511,7 +3605,7 @@ class BitbucketServer {
         repo_slug,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/branching-model/settings`
       );
@@ -3526,7 +3620,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting repository branching model settings", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
       });
@@ -3544,7 +3638,8 @@ class BitbucketServer {
     repo_slug: string,
     development?: Record<string, any>,
     production?: Record<string, any>,
-    branch_types?: Array<Record<string, any>>
+    branch_types?: Array<Record<string, any>>,
+    connectionId?: string
   ) {
     try {
       logger.info("Updating repository branching model settings", {
@@ -3561,7 +3656,7 @@ class BitbucketServer {
       if (production) updateData.production = production;
       if (branch_types) updateData.branch_types = branch_types;
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.put(
         `/repositories/${workspace}/${repo_slug}/branching-model/settings`,
         updateData
@@ -3577,7 +3672,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error updating repository branching model settings", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
       });
@@ -3592,7 +3687,8 @@ class BitbucketServer {
 
   async getEffectiveRepositoryBranchingModel(
     workspace: string,
-    repo_slug: string
+    repo_slug: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting effective repository branching model", {
@@ -3600,7 +3696,7 @@ class BitbucketServer {
         repo_slug,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/effective-branching-model`
       );
@@ -3615,7 +3711,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting effective repository branching model", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
       });
@@ -3628,9 +3724,9 @@ class BitbucketServer {
     }
   }
 
-  async getProjectBranchingModel(workspace: string, project_key: string) {
+  async getProjectBranchingModel(workspace: string, project_key: string, connectionId?: string) {
     try {
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       logger.info("Getting project branching model", {
         workspace,
         project_key,
@@ -3650,7 +3746,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting project branching model", {
-        error,
+        ...serializeError(error),
         workspace,
         project_key,
       });
@@ -3665,7 +3761,8 @@ class BitbucketServer {
 
   async getProjectBranchingModelSettings(
     workspace: string,
-    project_key: string
+    project_key: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting project branching model settings", {
@@ -3673,7 +3770,7 @@ class BitbucketServer {
         project_key,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.get(
         `/workspaces/${workspace}/projects/${project_key}/branching-model/settings`
       );
@@ -3688,7 +3785,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting project branching model settings", {
-        error,
+        ...serializeError(error),
         workspace,
         project_key,
       });
@@ -3706,7 +3803,8 @@ class BitbucketServer {
     project_key: string,
     development?: Record<string, any>,
     production?: Record<string, any>,
-    branch_types?: Array<Record<string, any>>
+    branch_types?: Array<Record<string, any>>,
+    connectionId?: string
   ) {
     try {
       logger.info("Updating project branching model settings", {
@@ -3723,7 +3821,7 @@ class BitbucketServer {
       if (production) updateData.production = production;
       if (branch_types) updateData.branch_types = branch_types;
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.put(
         `/workspaces/${workspace}/projects/${project_key}/branching-model/settings`,
         updateData
@@ -3739,7 +3837,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error updating project branching model settings", {
-        error,
+        ...serializeError(error),
         workspace,
         project_key,
       });
@@ -3757,7 +3855,8 @@ class BitbucketServer {
     repo_slug: string,
     pull_request_id: string,
     content: string,
-    inline?: InlineCommentInline
+    inline?: InlineCommentInline,
+    connectionId?: string
   ) {
     try {
       logger.info("Adding pending comment to Bitbucket pull request", {
@@ -3774,7 +3873,8 @@ class BitbucketServer {
         pull_request_id,
         content,
         inline,
-        true // Set pending to true for draft comment
+        true, // Set pending to true for draft comment
+        connectionId
       );
     } catch (error) {
       logger.error("Error adding pending comment to pull request", {
@@ -3795,7 +3895,8 @@ class BitbucketServer {
   async publishPendingComments(
     workspace: string,
     repo_slug: string,
-    pull_request_id: string
+    pull_request_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Publishing pending comments for Bitbucket pull request", {
@@ -3805,7 +3906,7 @@ class BitbucketServer {
       });
 
       // First, get all pending comments for the pull request
-      const { paginator, api } = this.getConfig();
+      const { paginator, api } = this.getConfig(connectionId);
       const commentsResult = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
         {
@@ -3902,7 +4003,8 @@ class BitbucketServer {
     description: string,
     sourceBranch: string,
     targetBranch: string,
-    reviewers?: string[]
+    reviewers?: string[],
+    connectionId?: string
   ) {
     try {
       logger.info("Creating draft Bitbucket pull request", {
@@ -3922,7 +4024,8 @@ class BitbucketServer {
         sourceBranch,
         targetBranch,
         reviewers,
-        true // Set draft to true
+        true, // Set draft to true
+        connectionId
       );
     } catch (error) {
       logger.error("Error creating draft pull request", {
@@ -3942,7 +4045,8 @@ class BitbucketServer {
   async publishDraftPullRequest(
     workspace: string,
     repo_slug: string,
-    pull_request_id: string
+    pull_request_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Publishing draft pull request", {
@@ -3952,7 +4056,7 @@ class BitbucketServer {
       });
 
       // Update the pull request to set draft=false
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.put(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`,
         {
@@ -3987,7 +4091,8 @@ class BitbucketServer {
   async convertTodraft(
     workspace: string,
     repo_slug: string,
-    pull_request_id: string
+    pull_request_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Converting pull request to draft", {
@@ -3997,7 +4102,7 @@ class BitbucketServer {
       });
 
       // Update the pull request to set draft=true
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.put(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`,
         {
@@ -4032,11 +4137,12 @@ class BitbucketServer {
   async getPendingReviewPRs(
     workspace?: string,
     limit: number = 50,
-    repositoryList?: string[]
+    repositoryList?: string[],
+    connectionId?: string
   ) {
     try {
       // Normalize workspace - handles any placeholder values AI might pass
-      const wsName = this.normalizeWorkspace(workspace);
+      const wsName = this.normalizeWorkspace(workspace, connectionId);
       if (!wsName) {
         throw new McpError(
           ErrorCode.InvalidParams,
@@ -4044,7 +4150,7 @@ class BitbucketServer {
         );
       }
 
-      const { config } = this.getConfig();
+      const { config } = this.getConfig(connectionId);
       const currentUserNickname = config.username;
       if (!currentUserNickname) {
         throw new McpError(
@@ -4071,7 +4177,7 @@ class BitbucketServer {
       } else {
         // Get all repositories in the workspace (existing behavior)
         logger.info("Getting all repositories in workspace...");
-        const { paginator, api } = this.getConfig();
+        const { paginator, api } = this.getConfig(connectionId);
         const reposResponse = await paginator.fetchValues(
           `/repositories/${wsName}`,
           {
@@ -4098,7 +4204,7 @@ class BitbucketServer {
       const batchSize = 5; // Process repositories in batches to avoid overwhelming the API
 
       // Process repositories in batches
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       for (let i = 0; i < repositoriesToCheck.length; i += batchSize) {
         const batch = repositoriesToCheck.slice(i, i + batchSize);
 
@@ -4220,7 +4326,7 @@ class BitbucketServer {
         ],
       };
     } catch (error) {
-      logger.error("Error getting pending review PRs:", error);
+      logger.error("Error getting pending review PRs:", serializeError(error));
       throw new McpError(
         ErrorCode.InternalError,
         `Failed to get pending review PRs: ${
@@ -4247,7 +4353,8 @@ class BitbucketServer {
       | "STOPPED",
     target_branch?: string,
     trigger_type?: "manual" | "push" | "pullrequest" | "schedule",
-    legacyLimit?: number
+    legacyLimit?: number,
+    connectionId?: string
   ) {
     try {
       logger.info("Listing pipeline runs", {
@@ -4266,7 +4373,7 @@ class BitbucketServer {
       if (target_branch) params["target.branch"] = target_branch;
       if (trigger_type) params.trigger_type = trigger_type;
 
-      const { paginator } = this.getConfig();
+      const { paginator } = this.getConfig(connectionId);
       const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pipelines`,
         {
@@ -4288,7 +4395,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error listing pipeline runs", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
       });
@@ -4304,7 +4411,8 @@ class BitbucketServer {
   async getPipelineRun(
     workspace: string,
     repo_slug: string,
-    pipeline_uuid: string
+    pipeline_uuid: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting pipeline run details", {
@@ -4313,7 +4421,7 @@ class BitbucketServer {
         pipeline_uuid,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pipelines/${pipeline_uuid}`
       );
@@ -4328,7 +4436,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pipeline run", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pipeline_uuid,
@@ -4346,7 +4454,8 @@ class BitbucketServer {
     workspace: string,
     repo_slug: string,
     target: any,
-    variables?: any[]
+    variables?: any[],
+    connectionId?: string
   ) {
     try {
       logger.info("Triggering pipeline run", {
@@ -4395,7 +4504,7 @@ class BitbucketServer {
         }));
       }
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pipelines`,
         requestData
@@ -4411,7 +4520,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error running pipeline", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
       });
@@ -4427,7 +4536,8 @@ class BitbucketServer {
   async stopPipeline(
     workspace: string,
     repo_slug: string,
-    pipeline_uuid: string
+    pipeline_uuid: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Stopping pipeline", {
@@ -4436,7 +4546,7 @@ class BitbucketServer {
         pipeline_uuid,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pipelines/${pipeline_uuid}/stop`
       );
@@ -4451,7 +4561,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error stopping pipeline", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pipeline_uuid,
@@ -4471,7 +4581,8 @@ class BitbucketServer {
     pipeline_uuid: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting pipeline steps", {
@@ -4483,7 +4594,7 @@ class BitbucketServer {
         all,
       });
 
-      const { paginator } = this.getConfig();
+      const { paginator } = this.getConfig(connectionId);
       const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pipelines/${pipeline_uuid}/steps`,
         {
@@ -4504,7 +4615,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pipeline steps", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pipeline_uuid,
@@ -4522,7 +4633,8 @@ class BitbucketServer {
     workspace: string,
     repo_slug: string,
     pipeline_uuid: string,
-    step_uuid: string
+    step_uuid: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting pipeline step details", {
@@ -4532,7 +4644,7 @@ class BitbucketServer {
         step_uuid,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pipelines/${pipeline_uuid}/steps/${step_uuid}`
       );
@@ -4547,7 +4659,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pipeline step", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pipeline_uuid,
@@ -4571,7 +4683,8 @@ class BitbucketServer {
     tail?: boolean,
     errorsOnly?: boolean,
     searchTerm?: string,
-    saveToFile?: boolean
+    saveToFile?: boolean,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting pipeline step logs", {
@@ -4586,7 +4699,7 @@ class BitbucketServer {
         saveToFile,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pipelines/${pipeline_uuid}/steps/${step_uuid}/log`,
         {
@@ -4693,7 +4806,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pipeline step logs", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pipeline_uuid,
@@ -4712,7 +4825,8 @@ class BitbucketServer {
     workspace: string,
     repo_slug: string,
     pull_request_id: string,
-    comment_id: string
+    comment_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting pull request comment", {
@@ -4722,7 +4836,7 @@ class BitbucketServer {
         comment_id,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`
       );
@@ -4737,7 +4851,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pull request comment", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -4757,7 +4871,8 @@ class BitbucketServer {
     repo_slug: string,
     pull_request_id: string,
     comment_id: string,
-    content: string
+    content: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Updating pull request comment", {
@@ -4767,7 +4882,7 @@ class BitbucketServer {
         comment_id,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.put(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`,
         {
@@ -4782,7 +4897,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error updating pull request comment", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -4801,7 +4916,8 @@ class BitbucketServer {
     workspace: string,
     repo_slug: string,
     pull_request_id: string,
-    comment_id: string
+    comment_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Deleting pull request comment", {
@@ -4811,7 +4927,7 @@ class BitbucketServer {
         comment_id,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       await api.delete(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`
       );
@@ -4821,7 +4937,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error deleting pull request comment", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -4841,7 +4957,8 @@ class BitbucketServer {
     repo_slug: string,
     pull_request_id: string,
     comment_id: string,
-    resolved: boolean
+    resolved: boolean,
+    connectionId?: string
   ) {
     try {
       logger.info("Setting comment resolved state", {
@@ -4865,7 +4982,7 @@ class BitbucketServer {
           if (visited.has(targetCommentId)) break;
           visited.add(targetCommentId);
 
-          const { api } = this.getConfig();
+          const { api } = this.getConfig(connectionId);
           const commentResponse = await api.get(
             commentUrl(targetCommentId)
           );
@@ -4888,7 +5005,7 @@ class BitbucketServer {
         targetCommentId = comment_id;
       }
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = resolved
         ? await api.post(resolveUrl(targetCommentId))
         : await api.delete(resolveUrl(targetCommentId));
@@ -4912,7 +5029,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error setting comment resolved state", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -4934,7 +5051,8 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting pull request diffstat", {
@@ -4946,7 +5064,7 @@ class BitbucketServer {
         all,
       });
 
-      const { paginator } = this.getConfig();
+      const { paginator } = this.getConfig(connectionId);
       const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/diffstat`,
         {
@@ -4964,7 +5082,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pull request diffstat", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -4981,7 +5099,8 @@ class BitbucketServer {
   async getPullRequestPatch(
     workspace: string,
     repo_slug: string,
-    pull_request_id: string
+    pull_request_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting pull request patch", {
@@ -4990,7 +5109,7 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.get(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/patch`,
         {
@@ -5003,7 +5122,7 @@ class BitbucketServer {
       return { content: [{ type: "text", text: response.data }] };
     } catch (error) {
       logger.error("Error getting pull request patch", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -5023,7 +5142,8 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting pull request tasks", {
@@ -5035,7 +5155,7 @@ class BitbucketServer {
         all,
       });
 
-      const { paginator } = this.getConfig();
+      const { paginator } = this.getConfig(connectionId);
       const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/tasks`,
         {
@@ -5053,7 +5173,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pull request tasks", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -5073,7 +5193,8 @@ class BitbucketServer {
     pull_request_id: string,
     content: string,
     commentId?: number,
-    state?: "OPEN" | "RESOLVED"
+    state?: "OPEN" | "RESOLVED",
+    connectionId?: string
   ) {
     try {
       logger.info("Creating pull request task", {
@@ -5086,7 +5207,7 @@ class BitbucketServer {
       if (commentId) data.comment = { id: commentId };
       if (state) data.state = state;
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.post(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/tasks`,
         data
@@ -5099,7 +5220,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error creating pull request task", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -5117,7 +5238,8 @@ class BitbucketServer {
     workspace: string,
     repo_slug: string,
     pull_request_id: string,
-    task_id: string
+    task_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting pull request task", {
@@ -5127,7 +5249,7 @@ class BitbucketServer {
         task_id,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.get(`/tasks/${task_id}`);
 
       return {
@@ -5137,7 +5259,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pull request task", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -5158,7 +5280,8 @@ class BitbucketServer {
     pull_request_id: string,
     task_id: string,
     content?: string,
-    state?: "OPEN" | "RESOLVED"
+    state?: "OPEN" | "RESOLVED",
+    connectionId?: string
   ) {
     try {
       logger.info("Updating pull request task", {
@@ -5172,7 +5295,7 @@ class BitbucketServer {
       if (content !== undefined) data.content = content;
       if (state !== undefined) data.state = state;
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       const response = await api.put(`/tasks/${task_id}`, data);
 
       return {
@@ -5182,7 +5305,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error updating pull request task", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -5201,7 +5324,8 @@ class BitbucketServer {
     workspace: string,
     repo_slug: string,
     pull_request_id: string,
-    task_id: string
+    task_id: string,
+    connectionId?: string
   ) {
     try {
       logger.info("Deleting pull request task", {
@@ -5211,7 +5335,7 @@ class BitbucketServer {
         task_id,
       });
 
-      const { api } = this.getConfig();
+      const { api } = this.getConfig(connectionId);
       await api.delete(`/tasks/${task_id}`);
 
       return {
@@ -5219,7 +5343,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error deleting pull request task", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
@@ -5240,7 +5364,8 @@ class BitbucketServer {
     pull_request_id: string,
     pagelen?: number,
     page?: number,
-    all?: boolean
+    all?: boolean,
+    connectionId?: string
   ) {
     try {
       logger.info("Getting pull request statuses", {
@@ -5252,7 +5377,7 @@ class BitbucketServer {
         all,
       });
 
-      const { paginator } = this.getConfig();
+      const { paginator } = this.getConfig(connectionId);
       const result = await paginator.fetchValues(
         `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/statuses`,
         {
@@ -5280,7 +5405,7 @@ class BitbucketServer {
       };
     } catch (error) {
       logger.error("Error getting pull request statuses", {
-        error,
+        ...serializeError(error),
         workspace,
         repo_slug,
         pull_request_id,
